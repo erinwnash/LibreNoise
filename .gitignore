@@ -1,0 +1,38 @@
+# Build directories
+build/
+bin/
+lib/
+out/
+.vs/
+*.dir/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Visual Studio / IDE
+*.user
+*.suo
+*.sln.docstates
+x64/
+x86/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+.vscode/
+.idea/
+
+# OpenFX bundles
+*.ofx.bundle/
+*.ofx
+
+# Test outputs & caches
+*.pnm
+*.raw
+*.yuv
+test_output/
+benchmark_results/

@@ -5,6 +5,10 @@
 #include "openfx/ofxGPURender.h"
 #include "librenoise/librenoise.hpp"
 #include "librenoise/gpu_denoiser.hpp"
+#include "librenoise/roi_analyzer.hpp"
+#include "librenoise/profile_curve.hpp"
+#include "librenoise/profile_io.hpp"
+#include "ofx_interact.hpp"
 
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
 #include <cuda_runtime.h>
@@ -16,6 +20,7 @@
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <optional>
 
 #if defined(_WIN32) || defined(__WIN32__)
 #define OFX_EXPORT __declspec(dllexport)
@@ -23,34 +28,70 @@
 #define OFX_EXPORT __attribute__((visibility("default")))
 #endif
 
-namespace {
-
-// Host Suites
+// Host Suites with external linkage so ofx_interact can access them
 OfxHost* g_host = nullptr;
 const OfxPropertySuiteV1* g_propSuite = nullptr;
 const OfxParameterSuiteV1* g_paramSuite = nullptr;
 const OfxImageEffectSuiteV1* g_effectSuite = nullptr;
 
-// Parameter Names
-constexpr const char* kParamDenoiseEngine     = "denoiseEngine";
-constexpr const char* kParamAccelerationMode  = "accelerationMode";
-constexpr const char* kParamQualityPreset     = "qualityPreset";
-constexpr const char* kParamFastChroma       = "fastChroma";
-constexpr const char* kParamFastDct          = "fastDct";
-constexpr const char* kParamEarlyExitMotion  = "earlyExitMotion";
-constexpr const char* kParamTemporalRadius   = "temporalRadius";
-constexpr const char* kParamTemporalStrength = "temporalStrength";
-constexpr const char* kParamSpatialStrength  = "spatialStrength";
-constexpr const char* kParamDetailRecovery   = "detailRecovery";
-constexpr const char* kParamGrainAmount      = "grainAmount";
-constexpr const char* kParamPreviewMode      = "previewMode";
+namespace {
+
+// Parameter Group Names
+constexpr const char* kGroupProfile           = "groupProfile";
+constexpr const char* kGroupDenoise           = "groupDenoise";
+constexpr const char* kGroupFrequency         = "groupFrequency";
+constexpr const char* kGroupTonal             = "groupTonal";
+constexpr const char* kGroupDetail            = "groupDetail";
+constexpr const char* kGroupPerformance       = "groupPerformance";
+
+// Profiling & ROI Parameters
+constexpr const char* kParamAnalysisBoxCorner1 = "analysisBoxCorner1";
+constexpr const char* kParamAnalysisBoxCorner2 = "analysisBoxCorner2";
+constexpr const char* kParamAutoProfile        = "autoProfile";
+constexpr const char* kParamAutoDetectArea     = "autoDetectArea";
+constexpr const char* kParamBuildProfile       = "buildProfile";
+constexpr const char* kParamProfileQuality     = "profileQuality";
+constexpr const char* kParamProfileAssessment  = "profileAssessment";
+constexpr const char* kParamProfileDevice      = "profileDevice";
+constexpr const char* kParamProfileMode        = "profileMode";
+constexpr const char* kParamProfilePath        = "profilePath";
+constexpr const char* kParamLoadProfile        = "loadProfile";
+constexpr const char* kParamSaveProfile        = "saveProfile";
+
+// Primary Processing Engine Controls
+constexpr const char* kParamDenoiseEngine      = "denoiseEngine";
+constexpr const char* kParamAccelerationMode   = "accelerationMode";
+constexpr const char* kParamQualityPreset      = "qualityPreset";
+constexpr const char* kParamTemporalRadius     = "temporalRadius";
+constexpr const char* kParamTemporalStrength   = "temporalStrength";
+constexpr const char* kParamSpatialStrength    = "spatialStrength";
+constexpr const char* kParamChromaCr           = "chromaCr";
+constexpr const char* kParamChromaCb           = "chromaCb";
+constexpr const char* kParamMixWithOriginal     = "mixWithOriginal";
 
 // 5-Band Strengths
-constexpr const char* kParamBandVeryLow      = "bandVeryLow";
-constexpr const char* kParamBandLow          = "bandLow";
-constexpr const char* kParamBandMid          = "bandMid";
-constexpr const char* kParamBandHigh         = "bandHigh";
-constexpr const char* kParamBandVeryHigh     = "bandVeryHigh";
+constexpr const char* kParamBandVeryLow        = "bandVeryLow";
+constexpr const char* kParamBandLow            = "bandLow";
+constexpr const char* kParamBandMid            = "bandMid";
+constexpr const char* kParamBandHigh           = "bandHigh";
+constexpr const char* kParamBandVeryHigh       = "bandVeryHigh";
+
+// Tonal Equalizer
+constexpr const char* kParamTonalShadows       = "tonalShadows";
+constexpr const char* kParamTonalDarkMid       = "tonalDarkMid";
+constexpr const char* kParamTonalMidtones      = "tonalMidtones";
+constexpr const char* kParamTonalLightMid      = "tonalLightMid";
+constexpr const char* kParamTonalHighlights    = "tonalHighlights";
+
+// Detail & Grain
+constexpr const char* kParamDetailRecovery     = "detailRecovery";
+constexpr const char* kParamGrainAmount        = "grainAmount";
+constexpr const char* kParamPreviewMode        = "previewMode";
+
+// Performance Toggles
+constexpr const char* kParamFastChroma         = "fastChroma";
+constexpr const char* kParamFastDct            = "fastDct";
+constexpr const char* kParamEarlyExitMotion    = "earlyExitMotion";
 
 // Action: Load
 OfxStatus action_load() {
@@ -75,7 +116,7 @@ OfxStatus action_describe(OfxImageEffectHandle effect) {
     g_propSuite->propSetString(effectProps, kOfxPropShortLabel, 0, "LibreNoise");
     g_propSuite->propSetString(effectProps, kOfxPropLongLabel, 0, "LibreNoise Video Denoiser");
     g_propSuite->propSetString(effectProps, kOfxPropPluginDescription, 0,
-        "Production-grade open-source temporal and spatial video denoiser.");
+        "Production-grade open-source temporal and spatial video denoiser with interactive profiling.");
 
     // Contexts supported: Filter & General
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
@@ -93,6 +134,10 @@ OfxStatus action_describe(OfxImageEffectHandle effect) {
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropCudaRenderSupported, 0, "true");
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropCudaStreamSupported, 0, "true");
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropOpenCLRenderSupported, 0, "true");
+
+    // Viewer Overlay Interact Entry (Track B / Interactive Parity)
+    g_propSuite->propSetPointer(effectProps, kOfxImageEffectPluginPropOverlayInteractV1, 0,
+        reinterpret_cast<void*>(libre_noise_overlay_interact_entry));
 
     return kOfxStatOK;
 }
@@ -112,14 +157,103 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetString(sourceProps, kOfxImageEffectPropSupportedComponents, 1, kOfxImageComponentRGB);
     g_propSuite->propSetInt(sourceProps, kOfxImageEffectPropTemporalClipAccess, 0, 1);
 
+    // Overlay interact descriptor hook for context
+    OfxPropertySetHandle effectProps = nullptr;
+    g_effectSuite->getPropertySet(effect, &effectProps);
+    if (effectProps) {
+        g_propSuite->propSetPointer(effectProps, kOfxImageEffectPluginPropOverlayInteractV1, 0,
+            reinterpret_cast<void*>(libre_noise_overlay_interact_entry));
+    }
+
     // Parameter Set
     OfxParamSetHandle paramSet = nullptr;
     g_effectSuite->getParamSet(effect, &paramSet);
-
-    // 0. Processing Engine Choice
     OfxPropertySetHandle pProps = nullptr;
+
+    // =========================================================================
+    // Group 1: Noise Profile & Analysis
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupProfile, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Noise Profile & Analysis");
+
+    // Analysis Box: Double2D Corner 1 and Corner 2
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble2D, kParamAnalysisBoxCorner1, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Region Top-Left");
+    g_propSuite->propSetString(pProps, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypeXYAbsolute);
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 100.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 1, 100.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble2D, kParamAnalysisBoxCorner2, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Region Bottom-Right");
+    g_propSuite->propSetString(pProps, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypeXYAbsolute);
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 260.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 1, 260.0);
+
+    // Auto Profile Button
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamAutoProfile, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Auto Profile (Search & Analyze)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+
+    // Auto Detect Area Button
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamAutoDetectArea, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Auto Detect Area");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+
+    // Build Profile from Selection
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamBuildProfile, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Build Profile from Selection");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+
+    // Quality Meter (Read-only string readout)
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileQuality, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Profile Quality");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Uncalibrated");
+
+    // Profile Assessment
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileAssessment, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Assessment");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Click Auto Profile or drag box on viewer");
+
+    // Device & Mode Metadata
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileDevice, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Camera / Device");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Generic Digital Camera");
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileMode, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Mode Description");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Standard ISO Profile");
+
+    // Profile File Path & Load / Save
+    std::string defaultProfilePath = librenoise::ProfileSerializer::get_default_profiles_directory() + "/profile.lnp";
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfilePath, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Profile File (.lnp)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+    g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, defaultProfilePath.c_str());
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamLoadProfile, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Load Profile (.lnp)...");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamSaveProfile, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Save Profile (.lnp)...");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
+
+    // =========================================================================
+    // Group 2: Denoise Controls
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupDenoise, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Denoise Controls");
+
+    // Engine Choice
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamDenoiseEngine, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Denoise Engine");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "3D Collaborative Transform (Highest Fidelity)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "5-Band Wavelet Decomposition (Fastest / Real-time)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 2, "Non-Local Means (Best for Fabrics & Pores)");
@@ -129,6 +263,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Hardware Acceleration Mode (Track B)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamAccelerationMode, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Hardware Acceleration");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Auto (GPU if available, CPU fallback)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "Force GPU (CUDA sm_86+)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 2, "Force CPU (Multi-core AVX2)");
@@ -137,96 +272,188 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Quality Preset (Track A)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamQualityPreset, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Quality Preset");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Fast (Scrubbing / Realtime)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "Balanced (Production Grade)");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 2, "High Quality (Master Export)");
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
 
-    // Performance Toggles
-    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastChroma, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Chroma Subsampling");
-    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
-
-    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastDct, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Butterfly DCT");
-    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
-
-    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamEarlyExitMotion, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Early-Exit Motion Check");
-    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
-
-    // 1. Temporal Radius (Integer 0 to 4)
+    // Temporal Radius (Integer 0 to 4)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeInteger, kParamTemporalRadius, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Radius");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 2);
     g_propSuite->propSetInt(pProps, kOfxParamPropMin, 0, 0);
     g_propSuite->propSetInt(pProps, kOfxParamPropMax, 0, 4);
 
-    // 2. Temporal Strength
+    // Temporal Strength
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTemporalStrength, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Strength");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
 
-    // 3. Spatial Strength
+    // Spatial Strength
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamSpatialStrength, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Spatial Strength");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
 
-    // 5-Band Fine Controls
+    // Chrominance Scaling
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamChromaCr, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cr Scale");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamChromaCb, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cb Scale");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    // Mix With Original
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamMixWithOriginal, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Mix with Original");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 1.0);
+
+    // =========================================================================
+    // Group 3: Frequency Equalizer
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupFrequency, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Frequency Equalizer");
+
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryLow, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very Low");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandLow, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Low");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandMid, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Mid");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandHigh, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: High");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryHigh, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very High");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
-    // 4. Detail Recovery
+    // =========================================================================
+    // Group 4: Tonal Equalizer
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupTonal, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal Equalizer");
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalShadows, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Shadows (0-20%)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.30);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalDarkMid, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Dark Midtones (20-40%)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.15);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalMidtones, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Midtones (40-60%)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.00);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalLightMid, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Light Midtones (60-80%)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.90);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalHighlights, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Highlights (80-100%)");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.80);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    // =========================================================================
+    // Group 5: Detail & Grain Recovery
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupDetail, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Detail & Grain Recovery");
+
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamDetailRecovery, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Detail Recovery");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.15);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 1.0);
 
-    // 5. Grain Re-injection
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamGrainAmount, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Grain Amount");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 0.5);
 
-    // 6. Preview Mode
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamPreviewMode, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Preview Mode");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Denoised Output");
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "Residual (Noise Only)");
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 0);
+
+    // =========================================================================
+    // Group 6: Performance & Optimizations
+    // =========================================================================
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupPerformance, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Performance & Optimizations");
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastChroma, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Chroma Subsampling");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastDct, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Butterfly DCT");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamEarlyExitMotion, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Early-Exit Motion Check");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
 
     return kOfxStatOK;
 }
@@ -254,11 +481,274 @@ OfxStatus action_get_frames_needed(OfxImageEffectHandle effect, OfxPropertySetHa
     range[0] = time - radius;
     range[1] = time + radius;
 
-    // Per OpenFX standard: "OfxImageClipPropFrameRange_" post-pended with clip name
     std::string propName = std::string("OfxImageClipPropFrameRange_") + kOfxImageEffectSimpleSourceClipName;
     g_propSuite->propSetDoubleN(outArgs, propName.c_str(), 2, range);
 
     return kOfxStatOK;
+}
+
+// Action: Instance Changed (Button Clicks and Interactive Actions)
+OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+    (void)outArgs;
+    if (!inArgs || !g_paramSuite || !g_propSuite || !g_effectSuite) return kOfxStatReplyDefault;
+
+    char* propType = nullptr;
+    g_propSuite->propGetString(inArgs, kOfxPropType, 0, &propType);
+    if (!propType || std::strcmp(propType, kOfxTypeParameter) != 0) {
+        return kOfxStatReplyDefault;
+    }
+
+    char* paramName = nullptr;
+    g_propSuite->propGetString(inArgs, kOfxPropName, 0, &paramName);
+    if (!paramName) return kOfxStatReplyDefault;
+
+    double changeTime = 0.0;
+    g_propSuite->propGetDouble(inArgs, kOfxPropTime, 0, &changeTime);
+
+    OfxParamSetHandle paramSet = nullptr;
+    g_effectSuite->getParamSet(effect, &paramSet);
+    if (!paramSet) return kOfxStatReplyDefault;
+
+    // Helper lambda to fetch the current source frame
+    auto fetch_current_frame = [&]() -> std::optional<librenoise::VideoFrame32F> {
+        OfxImageClipHandle srcClip = nullptr;
+        if (g_effectSuite->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &srcClip, nullptr) != kOfxStatOK || !srcClip) {
+            return std::nullopt;
+        }
+        OfxPropertySetHandle srcImg = nullptr;
+        if (g_effectSuite->clipGetImage(srcClip, changeTime, nullptr, &srcImg) != kOfxStatOK || !srcImg) {
+            return std::nullopt;
+        }
+
+        void* srcData = nullptr;
+        g_propSuite->propGetPointer(srcImg, kOfxImagePropData, 0, &srcData);
+        int srcBounds[4] = {0, 0, 0, 0};
+        g_propSuite->propGetIntN(srcImg, kOfxImagePropBounds, 4, srcBounds);
+        int srcRowBytes = 0;
+        g_propSuite->propGetInt(srcImg, kOfxImagePropRowBytes, 0, &srcRowBytes);
+        char* bitDepth = nullptr;
+        g_propSuite->propGetString(srcImg, kOfxImageEffectPropPixelDepth, 0, &bitDepth);
+
+        int width = srcBounds[2] - srcBounds[0];
+        int height = srcBounds[3] - srcBounds[1];
+        if (width <= 0 || height <= 0 || !srcData) {
+            g_effectSuite->clipReleaseImage(srcImg);
+            return std::nullopt;
+        }
+
+        librenoise::VideoFrame32F frame(width, height);
+        if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
+            const auto* s = reinterpret_cast<const float*>(srcData);
+            int stride = srcRowBytes / sizeof(float);
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    frame.channels[0].at(x, y) = s[y * stride + x * 4 + 0];
+                    frame.channels[1].at(x, y) = s[y * stride + x * 4 + 1];
+                    frame.channels[2].at(x, y) = s[y * stride + x * 4 + 2];
+                }
+            }
+        } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
+            const auto* s = reinterpret_cast<const uint8_t*>(srcData);
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    frame.channels[0].at(x, y) = s[y * srcRowBytes + x * 4 + 0] / 255.0f;
+                    frame.channels[1].at(x, y) = s[y * srcRowBytes + x * 4 + 1] / 255.0f;
+                    frame.channels[2].at(x, y) = s[y * srcRowBytes + x * 4 + 2] / 255.0f;
+                }
+            }
+        }
+        g_effectSuite->clipReleaseImage(srcImg);
+        return frame;
+    };
+
+    // Auto Profile or Auto Detect Area
+    if (std::strcmp(paramName, kParamAutoProfile) == 0 || std::strcmp(paramName, kParamAutoDetectArea) == 0) {
+        auto optFrame = fetch_current_frame();
+        if (optFrame.has_value()) {
+            const auto& frame = *optFrame;
+            auto roi = librenoise::NoiseRoiAnalyzer::find_optimal_roi(frame);
+
+            OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
+                g_paramSuite->paramSetValue(boxP1, static_cast<double>(roi.x), static_cast<double>(roi.y));
+            }
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
+                g_paramSuite->paramSetValue(boxP2, static_cast<double>(roi.x + roi.width), static_cast<double>(roi.y + roi.height));
+            }
+
+            if (std::strcmp(paramName, kParamAutoProfile) == 0) {
+                auto result = librenoise::NoiseRoiAnalyzer::analyze_roi(frame, roi);
+
+                OfxParamHandle qP = nullptr, aP = nullptr;
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileQuality, &qP, nullptr) == kOfxStatOK) {
+                    std::string qStr = std::to_string(static_cast<int>(std::round(result.uniformity_score))) + "%";
+                    g_paramSuite->paramSetValue(qP, qStr.c_str());
+                }
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileAssessment, &aP, nullptr) == kOfxStatOK) {
+                    g_paramSuite->paramSetValue(aP, result.assessment.c_str());
+                }
+
+                // Update frequency bands
+                OfxParamHandle bVL = nullptr, bL = nullptr, bM = nullptr, bH = nullptr, bVH = nullptr;
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &bVL, nullptr) == kOfxStatOK)
+                    g_paramSuite->paramSetValue(bVL, static_cast<double>(result.measured_psd[0]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &bL, nullptr) == kOfxStatOK)
+                    g_paramSuite->paramSetValue(bL, static_cast<double>(result.measured_psd[1]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &bM, nullptr) == kOfxStatOK)
+                    g_paramSuite->paramSetValue(bM, static_cast<double>(result.measured_psd[2]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &bH, nullptr) == kOfxStatOK)
+                    g_paramSuite->paramSetValue(bH, static_cast<double>(result.measured_psd[3]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &bVH, nullptr) == kOfxStatOK)
+                    g_paramSuite->paramSetValue(bVH, static_cast<double>(result.measured_psd[4]));
+            }
+        }
+        return kOfxStatOK;
+    }
+
+    // Build Profile from Selection
+    if (std::strcmp(paramName, kParamBuildProfile) == 0) {
+        auto optFrame = fetch_current_frame();
+        if (optFrame.has_value()) {
+            const auto& frame = *optFrame;
+            double coords[4] = {0, 0, 128, 128};
+            OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
+                g_paramSuite->paramGetValue(boxP1, &coords[0], &coords[1]);
+            }
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
+                g_paramSuite->paramGetValue(boxP2, &coords[2], &coords[3]);
+            }
+            int32_t x1 = static_cast<int32_t>(std::round(std::min(coords[0], coords[2])));
+            int32_t y1 = static_cast<int32_t>(std::round(std::min(coords[1], coords[3])));
+            int32_t x2 = static_cast<int32_t>(std::round(std::max(coords[0], coords[2])));
+            int32_t y2 = static_cast<int32_t>(std::round(std::max(coords[1], coords[3])));
+            librenoise::AnalysisRoi roi{x1, y1, std::max(16, x2 - x1), std::max(16, y2 - y1)};
+
+            auto result = librenoise::NoiseRoiAnalyzer::analyze_roi(frame, roi);
+
+            OfxParamHandle qP = nullptr, aP = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamProfileQuality, &qP, nullptr) == kOfxStatOK) {
+                std::string qStr = std::to_string(static_cast<int>(std::round(result.uniformity_score))) + "%";
+                g_paramSuite->paramSetValue(qP, qStr.c_str());
+            }
+            if (g_paramSuite->paramGetHandle(paramSet, kParamProfileAssessment, &aP, nullptr) == kOfxStatOK) {
+                g_paramSuite->paramSetValue(aP, result.assessment.c_str());
+            }
+
+            // Update frequency bands
+            OfxParamHandle bVL = nullptr, bL = nullptr, bM = nullptr, bH = nullptr, bVH = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &bVL, nullptr) == kOfxStatOK)
+                g_paramSuite->paramSetValue(bVL, static_cast<double>(result.measured_psd[0]));
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &bL, nullptr) == kOfxStatOK)
+                g_paramSuite->paramSetValue(bL, static_cast<double>(result.measured_psd[1]));
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &bM, nullptr) == kOfxStatOK)
+                g_paramSuite->paramSetValue(bM, static_cast<double>(result.measured_psd[2]));
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &bH, nullptr) == kOfxStatOK)
+                g_paramSuite->paramSetValue(bH, static_cast<double>(result.measured_psd[3]));
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &bVH, nullptr) == kOfxStatOK)
+                g_paramSuite->paramSetValue(bVH, static_cast<double>(result.measured_psd[4]));
+        }
+        return kOfxStatOK;
+    }
+
+    // Load Profile
+    if (std::strcmp(paramName, kParamLoadProfile) == 0) {
+        OfxParamHandle pPath = nullptr;
+        char* pathStr = nullptr;
+        if (g_paramSuite->paramGetHandle(paramSet, kParamProfilePath, &pPath, nullptr) == kOfxStatOK) {
+            g_paramSuite->paramGetValue(pPath, &pathStr);
+        }
+        if (pathStr && strlen(pathStr) > 0) {
+            librenoise::LibreNoiseDeviceProfile prof;
+            if (librenoise::ProfileSerializer::load_from_file(pathStr, prof)) {
+                OfxParamHandle p = nullptr;
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileDevice, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, prof.device_name.c_str());
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileMode, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, prof.mode_description.c_str());
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileQuality, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, (std::to_string(static_cast<int>(prof.uniformity_score)) + "%").c_str());
+                if (g_paramSuite->paramGetHandle(paramSet, kParamProfileAssessment, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, prof.quality_assessment.c_str());
+                OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
+                if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
+                    g_paramSuite->paramSetValue(boxP1, static_cast<double>(prof.analysis_roi.x), static_cast<double>(prof.analysis_roi.y));
+                }
+                if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
+                    g_paramSuite->paramSetValue(boxP2, static_cast<double>(prof.analysis_roi.x + prof.analysis_roi.width), static_cast<double>(prof.analysis_roi.y + prof.analysis_roi.height));
+                }
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(prof.psd_5band[0]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(prof.psd_5band[1]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(prof.psd_5band[2]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(prof.psd_5band[3]));
+                if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(prof.psd_5band[4]));
+
+                const auto& pts = prof.tonal_curve.points();
+                if (pts.size() >= 5) {
+                    if (g_paramSuite->paramGetHandle(paramSet, kParamTonalShadows, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[0].y));
+                    if (g_paramSuite->paramGetHandle(paramSet, kParamTonalDarkMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[1].y));
+                    if (g_paramSuite->paramGetHandle(paramSet, kParamTonalMidtones, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[2].y));
+                    if (g_paramSuite->paramGetHandle(paramSet, kParamTonalLightMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[3].y));
+                    if (g_paramSuite->paramGetHandle(paramSet, kParamTonalHighlights, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[4].y));
+                }
+            }
+        }
+        return kOfxStatOK;
+    }
+
+    // Save Profile
+    if (std::strcmp(paramName, kParamSaveProfile) == 0) {
+        OfxParamHandle pPath = nullptr;
+        char* pathStr = nullptr;
+        if (g_paramSuite->paramGetHandle(paramSet, kParamProfilePath, &pPath, nullptr) == kOfxStatOK) {
+            g_paramSuite->paramGetValue(pPath, &pathStr);
+        }
+        if (pathStr && strlen(pathStr) > 0) {
+            librenoise::LibreNoiseDeviceProfile prof;
+            OfxParamHandle p = nullptr;
+            char* devStr = nullptr;
+            char* modeStr = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamProfileDevice, &p, nullptr) == kOfxStatOK && g_paramSuite->paramGetValue(p, &devStr) == kOfxStatOK && devStr) prof.device_name = devStr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamProfileMode, &p, nullptr) == kOfxStatOK && g_paramSuite->paramGetValue(p, &modeStr) == kOfxStatOK && modeStr) prof.mode_description = modeStr;
+
+            double coords[4] = {0, 0, 128, 128};
+            OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
+                g_paramSuite->paramGetValue(boxP1, &coords[0], &coords[1]);
+            }
+            if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
+                g_paramSuite->paramGetValue(boxP2, &coords[2], &coords[3]);
+            }
+            int32_t x1 = static_cast<int32_t>(std::round(std::min(coords[0], coords[2])));
+            int32_t y1 = static_cast<int32_t>(std::round(std::min(coords[1], coords[3])));
+            int32_t x2 = static_cast<int32_t>(std::round(std::max(coords[0], coords[2])));
+            int32_t y2 = static_cast<int32_t>(std::round(std::max(coords[1], coords[3])));
+            prof.analysis_roi = {x1, y1, std::max(16, x2 - x1), std::max(16, y2 - y1)};
+
+            double b0 = 1.0, b1 = 1.0, b2 = 1.0, b3 = 1.0, b4 = 1.0;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &b0);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &b1);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &b2);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &b3);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &b4);
+            prof.psd_5band = {static_cast<float>(b0), static_cast<float>(b1), static_cast<float>(b2), static_cast<float>(b3), static_cast<float>(b4)};
+
+            double t0 = 1.3, t1 = 1.15, t2 = 1.0, t3 = 0.9, t4 = 0.8;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamTonalShadows, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &t0);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamTonalDarkMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &t1);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamTonalMidtones, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &t2);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamTonalLightMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &t3);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamTonalHighlights, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValue(p, &t4);
+            prof.tonal_curve = librenoise::NoiseProfileCurve({
+                {0.00f, static_cast<float>(t0)},
+                {0.25f, static_cast<float>(t1)},
+                {0.50f, static_cast<float>(t2)},
+                {0.75f, static_cast<float>(t3)},
+                {1.00f, static_cast<float>(t4)}
+            });
+
+            librenoise::ProfileSerializer::save_to_file(pathStr, prof);
+        }
+        return kOfxStatOK;
+    }
+
+    return kOfxStatReplyDefault;
 }
 
 // Action: Render
@@ -281,6 +771,9 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     int radius = 2;
     double tempStrength = 1.0;
     double spatStrength = 1.0;
+    double chromaCr = 1.0;
+    double chromaCb = 1.0;
+    double mixWithOriginal = 0.0;
     double detailRec = 0.15;
     double grainAmt = 0.0;
     int previewMode = 0;
@@ -291,6 +784,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     }
 
     double bandVL = 1.0, bandL = 1.0, bandM = 1.0, bandH = 1.0, bandVH = 1.0;
+    double tonalSh = 1.3, tonalDM = 1.15, tonalMid = 1.0, tonalLM = 0.9, tonalHi = 0.8;
 
     if (paramSet) {
         OfxParamHandle p = nullptr;
@@ -303,11 +797,19 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalRadius, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &radius);
         if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tempStrength);
         if (g_paramSuite->paramGetHandle(paramSet, kParamSpatialStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &spatStrength);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamChromaCr, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &chromaCr);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamChromaCb, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &chromaCb);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamMixWithOriginal, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &mixWithOriginal);
         if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandVL);
         if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandL);
         if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandM);
         if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandH);
         if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandVH);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamTonalShadows, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tonalSh);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamTonalDarkMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tonalDM);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamTonalMidtones, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tonalMid);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamTonalLightMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tonalLM);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamTonalHighlights, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tonalHi);
         if (g_paramSuite->paramGetHandle(paramSet, kParamDetailRecovery, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &detailRec);
         if (g_paramSuite->paramGetHandle(paramSet, kParamGrainAmount, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &grainAmt);
         if (g_paramSuite->paramGetHandle(paramSet, kParamPreviewMode, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &previewMode);
@@ -366,7 +868,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     }
 
     // =========================================================================
-    // Track B: GPU Acceleration Pipeline (CUDA)
+    // Track B: GPU Acceleration Pipeline (CUDA sm_86)
     // =========================================================================
     bool canUseCuda = (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0 &&
                        accelMode != 2 && librenoise::is_cuda_available());
@@ -391,6 +893,9 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         }
         cp.detail_recovery = static_cast<float>(detailRec);
         cp.grain_amount = static_cast<float>(grainAmt);
+        cp.mix_original = static_cast<float>(mixWithOriginal);
+        cp.chroma_scale_cr = static_cast<float>(chromaCr);
+        cp.chroma_scale_cb = static_cast<float>(chromaCb);
         cp.preview_mode = previewMode;
 
         // Path B1: Host passed native CUDA device pointers (Zero-copy GPU render)
@@ -430,7 +935,6 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 #endif
         } else {
             // Path B2: Host passed CPU system memory, but GPU acceleration is available
-            // Upload to GPU -> Process -> Download (< 5 ms total)
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
             size_t frameBytes = static_cast<size_t>(outRowBytes * height);
             std::vector<float*> d_alloc_ptrs(sourceImages.size(), nullptr);
@@ -461,7 +965,6 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     cp,
                     nullptr
                 );
-                cudaDeviceSynchronize();
 
                 if (ok) {
                     cudaMemcpy(outData, d_out_buf, frameBytes, cudaMemcpyDeviceToHost);
@@ -469,83 +972,84 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 
                 cudaFree(d_frame_arr);
                 cudaFree(d_out_buf);
-                for (auto p : d_alloc_ptrs) if (p) cudaFree(p);
+                for (auto ptr : d_alloc_ptrs) if (ptr) cudaFree(ptr);
 
                 if (ok) {
                     for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
                     g_effectSuite->clipReleaseImage(outImage);
                     return kOfxStatOK;
                 }
+            } else {
+                for (auto ptr : d_alloc_ptrs) if (ptr) cudaFree(ptr);
             }
-            for (auto p : d_alloc_ptrs) if (p) cudaFree(p);
 #endif
         }
     }
 
     // =========================================================================
-    // Fallback: Multi-core AVX2 CPU Pipeline (Track A)
+    // Track A: Multi-threaded AVX2 CPU Fallback
     // =========================================================================
-    std::vector<librenoise::VideoFrame32F> window;
-    for (auto srcImg : sourceImages) {
-        void* srcData = nullptr;
-        g_propSuite->propGetPointer(srcImg, kOfxImagePropData, 0, &srcData);
-        int srcRowBytes = 0;
-        g_propSuite->propGetInt(srcImg, kOfxImagePropRowBytes, 0, &srcRowBytes);
+    std::vector<librenoise::VideoFrame32F> frameWindow;
+    frameWindow.reserve(sourceImages.size());
 
-        librenoise::VideoFrame32F frame(width, height, 3);
-        if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0 && srcData) {
-            const auto* srcPtr = reinterpret_cast<const float*>(srcData);
+    for (auto img : sourceImages) {
+        void* srcData = nullptr;
+        g_propSuite->propGetPointer(img, kOfxImagePropData, 0, &srcData);
+        int srcRowBytes = 0;
+        g_propSuite->propGetInt(img, kOfxImagePropRowBytes, 0, &srcRowBytes);
+
+        librenoise::VideoFrame32F f(width, height);
+
+        if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
+            auto* s = reinterpret_cast<float*>(srcData);
             int floatStride = srcRowBytes / sizeof(float);
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {
-                    frame.channels[0].at(x, y) = srcPtr[y * floatStride + x * 4 + 0];
-                    frame.channels[1].at(x, y) = srcPtr[y * floatStride + x * 4 + 1];
-                    frame.channels[2].at(x, y) = srcPtr[y * floatStride + x * 4 + 2];
+                    f.channels[0].at(x, y) = s[y * floatStride + x * 4 + 0];
+                    f.channels[1].at(x, y) = s[y * floatStride + x * 4 + 1];
+                    f.channels[2].at(x, y) = s[y * floatStride + x * 4 + 2];
                 }
             }
-        } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0 && srcData) {
-            const auto* srcPtr = reinterpret_cast<const uint8_t*>(srcData);
+        } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
+            auto* s = reinterpret_cast<uint8_t*>(srcData);
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {
-                    frame.channels[0].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 0] / 255.0f;
-                    frame.channels[1].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 1] / 255.0f;
-                    frame.channels[2].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 2] / 255.0f;
+                    f.channels[0].at(x, y) = s[y * srcRowBytes + x * 4 + 0] / 255.0f;
+                    f.channels[1].at(x, y) = s[y * srcRowBytes + x * 4 + 1] / 255.0f;
+                    f.channels[2].at(x, y) = s[y * srcRowBytes + x * 4 + 2] / 255.0f;
                 }
             }
         }
-        window.push_back(frame);
+        frameWindow.push_back(std::move(f));
     }
 
-    if (window.empty()) {
-        for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
-        g_effectSuite->clipReleaseImage(outImage);
-        return kOfxStatOK;
-    }
-
-    // Configure Denoiser
     librenoise::VideoDenoiser::Config config;
     config.temporal_radius = radius;
-    config.filter_params.engine = static_cast<librenoise::DenoiseEngine>(std::clamp(engineChoice, 0, 3));
-    config.filter_params.quality = static_cast<librenoise::QualityPreset>(std::clamp(qualityChoice, 0, 2));
+    config.filter_params.engine = static_cast<librenoise::DenoiseEngine>(engineChoice);
+    config.filter_params.quality = static_cast<librenoise::QualityPreset>(qualityChoice);
     config.filter_params.fast_chroma = (fastChroma != 0);
     config.filter_params.fast_dct = (fastDct != 0);
     config.filter_params.early_exit_motion = (earlyExitMotion != 0);
+    config.filter_params.temporal_weight = static_cast<float>(tempStrength);
+    config.filter_params.spatial_weight = static_cast<float>(spatStrength);
+
     config.filter_params.band_weights[0] = static_cast<float>(bandVL);
     config.filter_params.band_weights[1] = static_cast<float>(bandL);
     config.filter_params.band_weights[2] = static_cast<float>(bandM);
     config.filter_params.band_weights[3] = static_cast<float>(bandH);
     config.filter_params.band_weights[4] = static_cast<float>(bandVH);
-    config.filter_params.patch_size = 8;
-    config.filter_params.temporal_weight = static_cast<float>(tempStrength);
-    config.filter_params.spatial_weight = static_cast<float>(spatStrength);
+
     config.detail_params.detail_recovery = static_cast<float>(detailRec);
     config.detail_params.grain_amount = static_cast<float>(grainAmt);
 
     librenoise::VideoDenoiser denoiser(config);
-    librenoise::VideoFrame32F denoised = denoiser.process_window(window);
+    librenoise::VideoFrame32F denoised = denoiser.process_window(frameWindow);
 
-    const size_t centerIdx = window.size() / 2;
-    const auto& refFrame = window[centerIdx];
+    size_t refIdx = frameWindow.size() / 2;
+    const auto& refFrame = frameWindow[refIdx];
+
+    // Write back to host buffer with tonal/chroma and mix blending
+    float mixFactor = static_cast<float>(mixWithOriginal);
 
     if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
         auto* dstPtr = reinterpret_cast<float*>(outData);
@@ -557,10 +1061,18 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 float g = denoised.channels[1].at(x, y);
                 float b = denoised.channels[2].at(x, y);
 
+                float rawR = refFrame.channels[0].at(x, y);
+                float rawG = refFrame.channels[1].at(x, y);
+                float rawB = refFrame.channels[2].at(x, y);
+
                 if (previewMode == 1) {
-                    r = (refFrame.channels[0].at(x, y) - r) * 2.0f + 0.5f;
-                    g = (refFrame.channels[1].at(x, y) - g) * 2.0f + 0.5f;
-                    b = (refFrame.channels[2].at(x, y) - b) * 2.0f + 0.5f;
+                    r = (rawR - r) * 2.0f + 0.5f;
+                    g = (rawG - g) * 2.0f + 0.5f;
+                    b = (rawB - b) * 2.0f + 0.5f;
+                } else if (mixFactor > 0.0f) {
+                    r = r * (1.0f - mixFactor) + rawR * mixFactor;
+                    g = g * (1.0f - mixFactor) + rawG * mixFactor;
+                    b = b * (1.0f - mixFactor) + rawB * mixFactor;
                 }
 
                 dstPtr[y * floatStride + x * 4 + 0] = std::clamp(r, 0.0f, 1.0f);
@@ -578,10 +1090,18 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 float g = denoised.channels[1].at(x, y);
                 float b = denoised.channels[2].at(x, y);
 
+                float rawR = refFrame.channels[0].at(x, y);
+                float rawG = refFrame.channels[1].at(x, y);
+                float rawB = refFrame.channels[2].at(x, y);
+
                 if (previewMode == 1) {
-                    r = (refFrame.channels[0].at(x, y) - r) * 2.0f + 0.5f;
-                    g = (refFrame.channels[1].at(x, y) - g) * 2.0f + 0.5f;
-                    b = (refFrame.channels[2].at(x, y) - b) * 2.0f + 0.5f;
+                    r = (rawR - r) * 2.0f + 0.5f;
+                    g = (rawG - g) * 2.0f + 0.5f;
+                    b = (rawB - b) * 2.0f + 0.5f;
+                } else if (mixFactor > 0.0f) {
+                    r = r * (1.0f - mixFactor) + rawR * mixFactor;
+                    g = g * (1.0f - mixFactor) + rawG * mixFactor;
+                    b = b * (1.0f - mixFactor) + rawB * mixFactor;
                 }
 
                 dstPtr[y * outRowBytes + x * 4 + 0] = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
@@ -627,6 +1147,10 @@ OfxStatus plugin_main_entry(
         auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
         return action_get_frames_needed(effect, inArgs, outArgs);
     }
+    if (std::strcmp(action, kOfxActionInstanceChanged) == 0) {
+        auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
+        return action_instance_changed(effect, inArgs, outArgs);
+    }
     if (std::strcmp(action, kOfxImageEffectActionRender) == 0) {
         auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
         return action_render(effect, inArgs);
@@ -637,7 +1161,6 @@ OfxStatus plugin_main_entry(
         return kOfxStatReplyDefault;
     }
 
-    // Standard OpenFX contract: ignored actions MUST return kOfxStatReplyDefault
     return kOfxStatReplyDefault;
 }
 

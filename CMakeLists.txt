@@ -23,6 +23,7 @@ endif()
 # Global options
 option(LIBRENOISE_BUILD_CLI "Build the headless CLI test harness" ON)
 option(LIBRENOISE_BUILD_OFX "Build the OpenFX 1.5 plugin module" ON)
+option(LIBRENOISE_BUILD_AE "Build the Adobe After Effects / Premiere Pro (.aex) plugin" ON)
 option(LIBRENOISE_BUILD_TESTS "Build test suite" ON)
 
 include_directories(include)
@@ -35,6 +36,10 @@ endif()
 
 if(LIBRENOISE_BUILD_OFX)
     add_subdirectory(src/ofx)
+endif()
+
+if(LIBRENOISE_BUILD_AE)
+    add_subdirectory(src/ae)
 endif()
 
 if(LIBRENOISE_BUILD_TESTS)

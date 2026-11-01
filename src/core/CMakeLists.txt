@@ -6,6 +6,9 @@ set(CORE_SOURCES
     filter.cpp
     detail.cpp
     core_pipeline.cpp
+    roi_analyzer.cpp
+    profile_curve.cpp
+    profile_io.cpp
 )
 
 if(LIBRENOISE_HAS_CUDA)

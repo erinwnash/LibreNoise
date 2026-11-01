@@ -17,6 +17,9 @@ struct CudaDenoiseParams {
     float nlf_b[3] = {0.0001f, 0.0001f, 0.0001f};
     float detail_recovery = 0.15f;
     float grain_amount = 0.0f;
+    float mix_original = 0.0f; // 0.0 = 100% denoised, 1.0 = 100% original
+    float chroma_scale_cb = 1.0f;
+    float chroma_scale_cr = 1.0f;
     int32_t preview_mode = 0; // 0 = denoised, 1 = residual
 };
 

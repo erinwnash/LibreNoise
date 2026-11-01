@@ -1,9 +1,18 @@
 add_library(librenoise_ofx MODULE
     plugin_main.cpp
+    ofx_interact.cpp
 )
 
 target_link_libraries(librenoise_ofx PRIVATE librenoise_core)
 target_compile_features(librenoise_ofx PRIVATE cxx_std_20)
+
+if(WIN32)
+    target_link_libraries(librenoise_ofx PRIVATE opengl32)
+elseif(APPLE)
+    target_link_libraries(librenoise_ofx PRIVATE "-framework OpenGL")
+else()
+    target_link_libraries(librenoise_ofx PRIVATE GL)
+endif()
 
 target_include_directories(librenoise_ofx PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include

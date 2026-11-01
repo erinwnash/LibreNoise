@@ -212,6 +212,7 @@ __global__ void k_postprocess_finalize(
     int stride_floats,
     float detail_recovery,
     float grain_amount,
+    float mix_original,
     int preview_mode,
     const float* __restrict__ nlf_a,
     const float* __restrict__ nlf_b,
@@ -253,6 +254,8 @@ __global__ void k_postprocess_finalize(
         // Preview Mode: 1 = Residual visual check
         if (preview_mode == 1) {
             filtered = (ref_val - filtered) * 2.0f + 0.5f;
+        } else if (mix_original > 0.0f) {
+            filtered = filtered * (1.0f - mix_original) + ref_val * mix_original;
         }
 
         d_output[pixel_idx + c] = fminf(1.0f, fmaxf(0.0f, filtered));
@@ -381,6 +384,7 @@ bool cuda_denoise_device(
         stride,
         params.detail_recovery,
         params.grain_amount,
+        params.mix_original,
         params.preview_mode,
         d_nlf_a,
         d_nlf_b,

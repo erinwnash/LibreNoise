@@ -57,6 +57,7 @@ public:
         float trust_sigma_multiplier = 2.5f; // Threshold for residual trust
         float cut_detection_threshold = 0.35f; // SAD ratio indicating scene cut
         bool enable_subpixel = true;
+        bool early_exit = true; // Early termination if center match is below noise floor
     };
 
     /**

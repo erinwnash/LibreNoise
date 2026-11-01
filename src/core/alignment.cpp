@@ -57,6 +57,32 @@ MotionField MotionEstimator::estimate(
             const int32_t ref_x = bx * bs;
             const int32_t ref_y = by * bs;
 
+            float avg_intensity = ref_luma.at(ref_x + bs / 2, ref_y + bs / 2);
+            float expected_noise_variance = nlf.variance_at(avg_intensity);
+            float trust_threshold = params.trust_sigma_multiplier * std::sqrt(expected_noise_variance);
+
+            // Fast center check: if the block is stationary, early-exit immediately
+            if (params.early_exit) {
+                float center_sad = 0.0f;
+                for (int32_t py = 0; py < bs; py += 2) {
+                    for (int32_t px = 0; px < bs; px += 2) {
+                        float r = ref_luma.at(ref_x + px, ref_y + py);
+                        float t = target_luma.at(ref_x + px, ref_y + py) * gain_correction;
+                        center_sad += std::abs(r - t);
+                    }
+                }
+                float center_mse = center_sad / static_cast<float>((bs / 2) * (bs / 2));
+                if (center_mse <= trust_threshold * 0.7f) {
+                    MotionVector mv;
+                    mv.dx = 0;
+                    mv.dy = 0;
+                    mv.residual = center_mse;
+                    mv.trusted = true;
+                    field.at(bx, by) = mv;
+                    continue;
+                }
+            }
+
             int32_t best_dx = 0;
             int32_t best_dy = 0;
             float min_sad = 1e9f;
@@ -112,10 +138,6 @@ MotionField MotionEstimator::estimate(
 
             // Mean squared error per pixel
             float mse = (min_sad / static_cast<float>(bs * bs));
-            
-            float avg_intensity = ref_luma.at(ref_x + bs / 2, ref_y + bs / 2);
-            float expected_noise_variance = nlf.variance_at(avg_intensity);
-            float trust_threshold = params.trust_sigma_multiplier * std::sqrt(expected_noise_variance);
 
             MotionVector mv;
             mv.dx = static_cast<int16_t>(best_dx);

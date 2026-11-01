@@ -9,6 +9,11 @@ target_include_directories(librenoise_ofx PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
 )
 
+if(LIBRENOISE_HAS_CUDA)
+    target_include_directories(librenoise_ofx PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(librenoise_ofx PRIVATE CUDA::cudart)
+endif()
+
 set_target_properties(librenoise_ofx PROPERTIES
     PREFIX ""
     SUFFIX ".ofx"

@@ -1,4 +1,8 @@
 #include "librenoise/librenoise.hpp"
+#include "librenoise/gpu_denoiser.hpp"
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+#include <cuda_runtime.h>
+#endif
 #include <iostream>
 #include <vector>
 #include <random>
@@ -151,6 +155,87 @@ int main(int argc, char* argv[]) {
 
         results.push_back({cand.label, ms, psnr, gain, res});
     }
+
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+    if (is_cuda_available()) {
+        std::cout << "[*] Benchmarking Engine: GPU Accelerated Pipeline (CUDA sm_86) ...\n";
+        size_t rgba_count = static_cast<size_t>(test_w * test_h * 4);
+        size_t rgba_bytes = rgba_count * sizeof(float);
+
+        std::vector<float> h_rgba(rgba_count);
+        std::vector<float*> d_frames(num_frames, nullptr);
+
+        for (size_t f = 0; f < num_frames; ++f) {
+            for (int y = 0; y < test_h; ++y) {
+                for (int x = 0; x < test_w; ++x) {
+                    size_t idx = (y * test_w + x) * 4;
+                    h_rgba[idx + 0] = noisy_sequence[f].channels[0].at(x, y);
+                    h_rgba[idx + 1] = noisy_sequence[f].channels[1].at(x, y);
+                    h_rgba[idx + 2] = noisy_sequence[f].channels[2].at(x, y);
+                    h_rgba[idx + 3] = 1.0f;
+                }
+            }
+            cudaMalloc(&d_frames[f], rgba_bytes);
+            cudaMemcpy(d_frames[f], h_rgba.data(), rgba_bytes, cudaMemcpyHostToDevice);
+        }
+
+        float* d_output = nullptr;
+        cudaMalloc(&d_output, rgba_bytes);
+
+        const float** d_frame_ptrs = nullptr;
+        cudaMalloc(&d_frame_ptrs, num_frames * sizeof(float*));
+        cudaMemcpy(d_frame_ptrs, d_frames.data(), num_frames * sizeof(float*), cudaMemcpyHostToDevice);
+
+        CudaDenoiseParams cp;
+        cp.width = test_w;
+        cp.height = test_h;
+        cp.stride_floats = test_w * 4;
+        cp.channels = 4;
+        cp.step_size = 4;
+        cp.temporal_weight = 1.0f;
+        cp.spatial_weight = 1.0f;
+        for (int b = 0; b < 5; ++b) cp.band_weights[b] = 1.0f;
+        for (int c = 0; c < 3; ++c) {
+            cp.nlf_a[c] = ground_truth.nlf.a;
+            cp.nlf_b[c] = ground_truth.nlf.b;
+        }
+        cp.detail_recovery = 0.05f;
+        cp.grain_amount = 0.0f;
+        cp.preview_mode = 0;
+
+        // Warmup
+        cuda_denoise_device(d_frame_ptrs, static_cast<int32_t>(num_frames), static_cast<int32_t>(num_frames / 2), d_output, cp);
+        cudaDeviceSynchronize();
+
+        // Benchmark timing
+        auto start = std::chrono::high_resolution_clock::now();
+        cuda_denoise_device(d_frame_ptrs, static_cast<int32_t>(num_frames), static_cast<int32_t>(num_frames / 2), d_output, cp);
+        cudaDeviceSynchronize();
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+        std::vector<float> h_out(rgba_count);
+        cudaMemcpy(h_out.data(), d_output, rgba_bytes, cudaMemcpyDeviceToHost);
+
+        ImagePlane32F gpu_plane(test_w, test_h);
+        for (int y = 0; y < test_h; ++y) {
+            for (int x = 0; x < test_w; ++x) {
+                gpu_plane.at(x, y) = h_out[(y * test_w + x) * 4 + 0];
+            }
+        }
+
+        double psnr = compute_psnr(ground_truth.clean.channels[0], gpu_plane);
+        double gain = psnr - raw_psnr;
+        double res = compute_residual_energy(noisy_sequence[num_frames / 2].channels[0], gpu_plane);
+
+        results.push_back({"GPU Accelerated (CUDA sm_86)", ms, psnr, gain, res});
+
+        cudaFree(d_output);
+        cudaFree(d_frame_ptrs);
+        for (auto p : d_frames) cudaFree(p);
+    }
+#endif
 
     std::cout << "\n========================================================================================\n";
     std::cout << "                       CANDIDATE ENGINE COMPARISON MATRIX\n";

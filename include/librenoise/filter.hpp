@@ -15,8 +15,20 @@ enum class DenoiseEngine {
     FrequencyDomain3D = 3   // 3D Spectral Window Shrinkage (Best for Sensor Banding & Chroma)
 };
 
+enum class QualityPreset {
+    Fast = 0,       // Real-time timeline playback (step_size = 6, fast chroma)
+    Balanced = 1,   // Production grading (step_size = 4, fast chroma)
+    HighQuality = 2 // Master export (step_size = 3, full redundancy)
+};
+
 struct FilterParams {
     DenoiseEngine engine = DenoiseEngine::Collaborative3D;
+    QualityPreset quality = QualityPreset::Balanced;
+
+    // Performance & Optimization Toggles
+    bool fast_dct = true;            // Use unrolled AAN butterfly (0 trig calls)
+    bool fast_chroma = true;         // Subsample chroma patch evaluations by 2x
+    bool early_exit_motion = true;   // Terminate block matching early when error < noise floor
 
     // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High]
     std::array<float, 5> band_weights{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
@@ -24,7 +36,7 @@ struct FilterParams {
     // Collaborative 3D Parameters
     int32_t patch_size = 8;
     int32_t max_group_size = 16;
-    int32_t step_size = 3;
+    int32_t step_size = 4;           // Derived from QualityPreset, can be overridden
     int32_t search_window = 16;
     float hard_thresh_lambda = 2.7f;
     float temporal_weight = 1.0f;

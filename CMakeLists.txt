@@ -9,6 +9,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# CUDA Toolkit Detection
+find_package(CUDAToolkit)
+if(CUDAToolkit_FOUND)
+    message(STATUS "CUDA Toolkit found: ${CUDAToolkit_VERSION} (include: ${CUDAToolkit_INCLUDE_DIRS})")
+    set(LIBRENOISE_HAS_CUDA ON)
+    add_compile_definitions(LIBRENOISE_HAS_CUDA=1)
+else()
+    message(STATUS "CUDA Toolkit not found, building CPU-only")
+    set(LIBRENOISE_HAS_CUDA OFF)
+endif()
+
 # Global options
 option(LIBRENOISE_BUILD_CLI "Build the headless CLI test harness" ON)
 option(LIBRENOISE_BUILD_OFX "Build the OpenFX 1.5 plugin module" ON)

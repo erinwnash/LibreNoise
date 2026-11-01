@@ -47,12 +47,15 @@ VideoFrame32F VideoDenoiser::process_window(
         // Exposure drift calculation for dissolves/fades
         float drift_ratio = NoiseProfiler::compute_exposure_drift(ref_luma, cand_luma);
 
+        auto match_params = config_.match_params;
+        match_params.early_exit = config_.filter_params.early_exit_motion;
+
         motion_fields[i] = MotionEstimator::estimate(
             ref_luma,
             cand_luma,
             active_profile.nlf_per_channel[0],
             drift_ratio,
-            config_.match_params
+            match_params
         );
     }
 

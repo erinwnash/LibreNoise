@@ -13,32 +13,37 @@ namespace librenoise {
 namespace {
 
 // =========================================================================
-// 8-point Discrete Cosine Transform (Orthonormal DCT-II)
+// Precomputed Exact Orthonormal 8-point Discrete Cosine Transform (0 Trig Calls)
 // =========================================================================
-inline void dct8_1d(const float in[8], float out[8]) {
-    constexpr float s0 = 0.35355339f; // 1 / sqrt(8)
-    constexpr float s = 0.5f;          // sqrt(2 / 8)
-
-    for (int k = 0; k < 8; ++k) {
-        float sum = 0.0f;
-        float factor = (k == 0) ? s0 : s;
-        for (int n = 0; n < 8; ++n) {
-            sum += in[n] * std::cos((3.141592653589793f / 8.0f) * (n + 0.5f) * k);
+struct DctTableInit {
+    float mat[8][8];
+    DctTableInit() {
+        constexpr float s0 = 0.35355339059327376f;
+        constexpr float s = 0.5f;
+        constexpr double pi = 3.14159265358979323846;
+        for (int k = 0; k < 8; ++k) {
+            float factor = (k == 0) ? s0 : s;
+            for (int n = 0; n < 8; ++n) {
+                mat[k][n] = factor * static_cast<float>(std::cos((pi / 8.0) * (n + 0.5) * k));
+            }
         }
-        out[k] = factor * sum;
+    }
+};
+static const DctTableInit g_dct_table;
+
+inline void dct8_1d(const float in[8], float out[8]) {
+    const auto& m = g_dct_table.mat;
+    for (int k = 0; k < 8; ++k) {
+        out[k] = m[k][0] * in[0] + m[k][1] * in[1] + m[k][2] * in[2] + m[k][3] * in[3] +
+                 m[k][4] * in[4] + m[k][5] * in[5] + m[k][6] * in[6] + m[k][7] * in[7];
     }
 }
 
 inline void idct8_1d(const float in[8], float out[8]) {
-    constexpr float s0 = 0.35355339f;
-    constexpr float s = 0.5f;
-
+    const auto& m = g_dct_table.mat;
     for (int n = 0; n < 8; ++n) {
-        float sum = s0 * in[0];
-        for (int k = 1; k < 8; ++k) {
-            sum += s * in[k] * std::cos((3.141592653589793f / 8.0f) * (n + 0.5f) * k);
-        }
-        out[n] = sum;
+        out[n] = m[0][n] * in[0] + m[1][n] * in[1] + m[2][n] * in[2] + m[3][n] * in[3] +
+                 m[4][n] * in[4] + m[5][n] * in[5] + m[6][n] * in[6] + m[7][n] * in[7];
     }
 }
 
@@ -627,8 +632,17 @@ void FilterDispatcher::process(
         temporal_frames[ref_index].transfer
     );
 
+    FilterParams active_params = params;
+    if (active_params.quality == QualityPreset::Fast) {
+        active_params.step_size = 6;
+    } else if (active_params.quality == QualityPreset::Balanced) {
+        active_params.step_size = 4;
+    } else if (active_params.quality == QualityPreset::HighQuality) {
+        active_params.step_size = 3;
+    }
+
     std::unique_ptr<ISpatialEngine> engine;
-    switch (params.engine) {
+    switch (active_params.engine) {
         case DenoiseEngine::Wavelet5Band:
             engine = std::make_unique<Wavelet5BandFilter>();
             break;
@@ -640,7 +654,7 @@ void FilterDispatcher::process(
             break;
         case DenoiseEngine::Collaborative3D:
         default:
-            engine = std::make_unique<CollaborativePatchFilter3D>(params);
+            engine = std::make_unique<CollaborativePatchFilter3D>(active_params);
             break;
     }
 
@@ -653,8 +667,13 @@ void FilterDispatcher::process(
         mf_ptrs.reserve(motion_fields.size());
         for (const auto& mf : motion_fields) mf_ptrs.push_back(&mf);
 
+        FilterParams channel_params = active_params;
+        if (c > 0 && active_params.fast_chroma) {
+            channel_params.step_size = std::min(active_params.step_size * 2, 8);
+        }
+
         const auto& nlf = profile.nlf_per_channel[std::min(c, size_t{2})];
-        engine->process_plane(planes, ref_index, mf_ptrs, nlf, profile.psd, params, output_frame.channels[c]);
+        engine->process_plane(planes, ref_index, mf_ptrs, nlf, profile.psd, channel_params, output_frame.channels[c]);
     }
 }
 

@@ -10,6 +10,7 @@ struct CudaDenoiseParams {
     int32_t stride_floats = 0;
     int32_t channels = 4; // 4 for RGBA
     int32_t step_size = 4; // Stride of patches (4 = balanced, 6 = fast, 3 = high quality)
+    float hard_thresh_lambda = 2.7f;
     float temporal_weight = 1.0f;
     float spatial_weight = 1.0f;
     float band_weights[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};

@@ -18,28 +18,22 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
     const int32_t h = frame.height;
     const int32_t ps = params.patch_size;
 
-    struct PatchStats {
-        float mean = 0.0f;
-        float variance = 0.0f;
+    struct PatchLocation {
+        int32_t x = 0;
+        int32_t y = 0;
         float grad_norm = 0.0f;
     };
 
-    std::vector<PatchStats> flat_patches;
+    std::vector<PatchLocation> flat_patches;
 
     // Scan frame for low-gradient candidate patches
     const auto& luma = frame.channels[0];
     for (int32_t y = ps; y + ps < h; y += ps) {
         for (int32_t x = ps; x + ps < w; x += ps) {
-            float sum = 0.0f;
-            float sum_sq = 0.0f;
             float grad_sum = 0.0f;
 
             for (int32_t py = 0; py < ps; ++py) {
                 for (int32_t px = 0; px < ps; ++px) {
-                    float val = luma.at(x + px, y + py);
-                    sum += val;
-                    sum_sq += val * val;
-
                     // Simple gradient
                     float gx = luma.at(x + px + 1, y + py) - luma.at(x + px - 1, y + py);
                     float gy = luma.at(x + px, y + py + 1) - luma.at(x + px, y + py - 1);
@@ -48,18 +42,16 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
             }
 
             float count = static_cast<float>(ps * ps);
-            float mean = sum / count;
-            float var = std::max(0.0f, (sum_sq / count) - (mean * mean));
             float mean_grad = grad_sum / count;
 
             if (mean_grad < params.flatness_threshold) {
-                flat_patches.push_back({mean, var, mean_grad});
+                flat_patches.push_back({x, y, mean_grad});
             }
         }
     }
 
-    // Sort by lowest gradient / variance
-    std::sort(flat_patches.begin(), flat_patches.end(), [](const PatchStats& a, const PatchStats& b) {
+    // Sort by lowest gradient
+    std::sort(flat_patches.begin(), flat_patches.end(), [](const PatchLocation& a, const PatchLocation& b) {
         return a.grad_norm < b.grad_norm;
     });
 
@@ -67,32 +59,57 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
         flat_patches.resize(static_cast<size_t>(params.max_patches));
     }
 
-    // Robust linear fit for Var(I) = a*I + b if sufficient patches found
-    if (flat_patches.size() >= 5) {
-        float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
-        for (const auto& p : flat_patches) {
-            sum_x += p.mean;
-            sum_y += p.variance;
-            sum_xy += p.mean * p.variance;
-            sum_xx += p.mean * p.mean;
-        }
-        float n = static_cast<float>(flat_patches.size());
-        float denom = (n * sum_xx - sum_x * sum_x);
-        if (std::abs(denom) > 1e-7f) {
-            float slope = (n * sum_xy - sum_x * sum_y) / denom;
-            float intercept = (sum_y - slope * sum_x) / n;
-            profile.nlf_per_channel[0].a = std::clamp(slope, 1e-6f, 0.05f);
-            profile.nlf_per_channel[0].b = std::clamp(intercept, 1e-7f, 0.01f);
-        }
-    } else {
-        // Fallback default
-        profile.nlf_per_channel[0].a = 0.0005f;
-        profile.nlf_per_channel[0].b = 0.00005f;
-    }
+    size_t num_ch = std::min(size_t{3}, frame.channel_count());
+    for (size_t c = 0; c < 3; ++c) {
+        size_t src_c = std::min(c, num_ch - 1);
+        const auto& plane = frame.channels[src_c];
 
-    // Chroma channels typically have lower shot noise slope but cross-coupling
-    profile.nlf_per_channel[1] = profile.nlf_per_channel[0];
-    profile.nlf_per_channel[2] = profile.nlf_per_channel[0];
+        if (flat_patches.size() >= 5) {
+            float sum_x = 0.0f, sum_y = 0.0f, sum_xy = 0.0f, sum_xx = 0.0f;
+            float total_var = 0.0f;
+
+            for (const auto& loc : flat_patches) {
+                float patch_sum = 0.0f;
+                float patch_sum_sq = 0.0f;
+                for (int32_t py = 0; py < ps; ++py) {
+                    for (int32_t px = 0; px < ps; ++px) {
+                        float v = plane.at(loc.x + px, loc.y + py);
+                        patch_sum += v;
+                        patch_sum_sq += v * v;
+                    }
+                }
+                float count = static_cast<float>(ps * ps);
+                float mean = patch_sum / count;
+                float var = std::max(1e-8f, (patch_sum_sq / count) - (mean * mean));
+
+                sum_x += mean;
+                sum_y += var;
+                sum_xy += mean * var;
+                sum_xx += mean * mean;
+                total_var += var;
+            }
+
+            float n = static_cast<float>(flat_patches.size());
+            float avg_var = total_var / n;
+            float denom = (n * sum_xx - sum_x * sum_x);
+
+            if (std::abs(denom) > 1e-7f) {
+                float slope = (n * sum_xy - sum_x * sum_y) / denom;
+                float intercept = (sum_y - slope * sum_x) / n;
+                slope = std::clamp(slope, 1e-6f, 0.05f);
+                intercept = std::clamp(intercept, avg_var * 0.4f, 0.02f);
+                profile.nlf_per_channel[c].a = slope;
+                profile.nlf_per_channel[c].b = intercept;
+            } else {
+                profile.nlf_per_channel[c].a = 0.0005f;
+                profile.nlf_per_channel[c].b = std::clamp(avg_var, 1e-7f, 0.02f);
+            }
+        } else {
+            // Fallback default
+            profile.nlf_per_channel[c].a = 0.0005f;
+            profile.nlf_per_channel[c].b = 0.0001f;
+        }
+    }
 
     return profile;
 }

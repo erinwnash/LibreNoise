@@ -190,12 +190,26 @@ PF_Err handle_render(
     PF_LayerDef* input = reinterpret_cast<PF_LayerDef*>(params[PARAM_INPUT]);
     if (!input || !input->data) return PF_Err_NONE;
 
+    // Convert input to VideoFrame32F for accurate profiling / fallback
+    VideoFrame32F frame(width, height);
+    const auto* src = reinterpret_cast<const float*>(input->data);
+    int floatStride = rowbytes / static_cast<int>(sizeof(float));
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            frame.channels[0].at(x, y) = src[y * floatStride + x * 4 + 0]; // R
+            frame.channels[1].at(x, y) = src[y * floatStride + x * 4 + 1]; // G
+            frame.channels[2].at(x, y) = src[y * floatStride + x * 4 + 2]; // B
+        }
+    }
+
+    auto autoProf = NoiseProfiler::auto_estimate(frame);
+
     // Check if CUDA GPU is available for zero-overhead acceleration
     if (is_cuda_available()) {
         CudaDenoiseParams cp;
         cp.width = width;
         cp.height = height;
-        cp.stride_floats = rowbytes / static_cast<int32_t>(sizeof(float));
+        cp.stride_floats = floatStride;
         cp.channels = 4;
         cp.step_size = 4;
         cp.temporal_weight = 1.0f;
@@ -203,8 +217,8 @@ PF_Err handle_render(
         cp.detail_recovery = 0.15f;
         cp.grain_amount = 0.0f;
         for (int i = 0; i < 3; ++i) {
-            cp.nlf_a[i] = 0.00035f;
-            cp.nlf_b[i] = 0.00003f;
+            cp.nlf_a[i] = autoProf.nlf_per_channel[i].a;
+            cp.nlf_b[i] = autoProf.nlf_per_channel[i].b;
         }
 
         // Process via GPU
@@ -234,17 +248,6 @@ PF_Err handle_render(
             if (ok) return PF_Err_NONE;
         }
 #endif
-    }
-
-    // High-performance AVX2 CPU Fallback
-    VideoFrame32F frame(width, height);
-    const auto* src = reinterpret_cast<const uint8_t*>(input->data);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            frame.channels[0].at(x, y) = src[y * rowbytes + x * 4 + 1] / 255.0f; // R
-            frame.channels[1].at(x, y) = src[y * rowbytes + x * 4 + 2] / 255.0f; // G
-            frame.channels[2].at(x, y) = src[y * rowbytes + x * 4 + 3] / 255.0f; // B
-        }
     }
 
     VideoDenoiser::Config cfg;

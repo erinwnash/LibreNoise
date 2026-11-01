@@ -43,164 +43,41 @@ __device__ inline float hash_noise(int x, int y, uint32_t seed) {
 }
 
 // =========================================================================
-// Kernel 1: Temporal Motion-Compensated & Gated Filter (Neighborhood-Aware)
+// Kernel 1: 3D Collaborative Spatiotemporal BM3D Transform Filter
 // =========================================================================
-__device__ inline float fetch_luma_clamped(
-    const float* __restrict__ frame,
-    int x,
-    int y,
-    int width,
-    int height,
-    int stride_floats
-) {
-    x = min(max(x, 0), width - 1);
-    y = min(max(y, 0), height - 1);
-    int idx = y * stride_floats + x * 4;
-    return 0.2126f * frame[idx + 0] + 0.7152f * frame[idx + 1] + 0.0722f * frame[idx + 2];
-}
-
-__global__ void k_temporal_accumulation(
+__global__ void k_bm3d_collaborative_filter(
     const float* const* __restrict__ d_frames,
     int frame_count,
     int ref_index,
     int width,
     int height,
     int stride_floats,
-    float temporal_weight,
-    const float* __restrict__ nlf_a,
-    const float* __restrict__ nlf_b,
-    float* __restrict__ d_temp_accum
-) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height) return;
-
-    int pixel_idx = y * stride_floats + x * 4;
-    const float* ref_frame = d_frames[ref_index];
-
-    // Early bypass: if temporal filtering is disabled or single frame
-    if (frame_count <= 1 || temporal_weight <= 0.01f) {
-        d_temp_accum[pixel_idx + 0] = ref_frame[pixel_idx + 0];
-        d_temp_accum[pixel_idx + 1] = ref_frame[pixel_idx + 1];
-        d_temp_accum[pixel_idx + 2] = ref_frame[pixel_idx + 2];
-        d_temp_accum[pixel_idx + 3] = ref_frame[pixel_idx + 3];
-        return;
-    }
-
-    // Reference center luma & 4-cross neighbors
-    float ref_c = fetch_luma_clamped(ref_frame, x,     y,     width, height, stride_floats);
-    float ref_l = fetch_luma_clamped(ref_frame, x - 1, y,     width, height, stride_floats);
-    float ref_r = fetch_luma_clamped(ref_frame, x + 1, y,     width, height, stride_floats);
-    float ref_u = fetch_luma_clamped(ref_frame, x,     y - 1, width, height, stride_floats);
-    float ref_d = fetch_luma_clamped(ref_frame, x,     y + 1, width, height, stride_floats);
-
-    // Compute expected noise variance of luma
-    float var_luma = fmaxf(1e-7f, nlf_a[0] * ref_c + nlf_b[0]);
-    float sigma_luma = sqrtf(var_luma);
-
-    // Motion gating threshold: above this, candidate patch is moving/occluded and strictly rejected
-    float motion_rejection_limit = 1.75f * sigma_luma * fmaxf(0.5f, temporal_weight);
-
-    float sum_r = ref_frame[pixel_idx + 0];
-    float sum_g = ref_frame[pixel_idx + 1];
-    float sum_b = ref_frame[pixel_idx + 2];
-    float total_weight = 1.0f;
-
-    // Search offsets: 17 candidates up to radius 4
-    const int num_candidates = 17;
-    const int search_dx[17] = {0,  1, -1,  0,  0,  1, -1,  1, -1,  2, -2,  0,  0,  4, -4,  0,  0};
-    const int search_dy[17] = {0,  0,  0,  1, -1,  1, -1, -1,  1,  0,  0,  2, -2,  0,  0,  4, -4};
-
-    for (int f = 0; f < frame_count; ++f) {
-        if (f == ref_index) continue;
-        const float* cand_frame = d_frames[f];
-
-        int best_dx = 0;
-        int best_dy = 0;
-        float min_mae = 1e9f;
-
-        // 1. Test stationary (0, 0)
-        float cand_c0 = fetch_luma_clamped(cand_frame, x,     y,     width, height, stride_floats);
-        float cand_l0 = fetch_luma_clamped(cand_frame, x - 1, y,     width, height, stride_floats);
-        float cand_r0 = fetch_luma_clamped(cand_frame, x + 1, y,     width, height, stride_floats);
-        float cand_u0 = fetch_luma_clamped(cand_frame, x,     y - 1, width, height, stride_floats);
-        float cand_d0 = fetch_luma_clamped(cand_frame, x,     y + 1, width, height, stride_floats);
-
-        float mae_0 = 0.2f * (fabsf(ref_c - cand_c0) + fabsf(ref_l - cand_l0) +
-                              fabsf(ref_r - cand_r0) + fabsf(ref_u - cand_u0) +
-                              fabsf(ref_d - cand_d0));
-
-        if (mae_0 <= 1.15f * sigma_luma) {
-            min_mae = mae_0;
-            best_dx = 0;
-            best_dy = 0;
-        } else {
-            min_mae = mae_0;
-            #pragma unroll
-            for (int s = 1; s < num_candidates; ++s) {
-                int cx = x + search_dx[s];
-                int cy = y + search_dy[s];
-                float cc = fetch_luma_clamped(cand_frame, cx,     cy,     width, height, stride_floats);
-                float cl = fetch_luma_clamped(cand_frame, cx - 1, cy,     width, height, stride_floats);
-                float cr = fetch_luma_clamped(cand_frame, cx + 1, cy,     width, height, stride_floats);
-                float cu = fetch_luma_clamped(cand_frame, cx,     cy - 1, width, height, stride_floats);
-                float cd = fetch_luma_clamped(cand_frame, cx,     cy + 1, width, height, stride_floats);
-
-                float mae = 0.2f * (fabsf(ref_c - cc) + fabsf(ref_l - cl) +
-                                    fabsf(ref_r - cr) + fabsf(ref_u - cu) +
-                                    fabsf(ref_d - cd));
-                if (mae < min_mae) {
-                    min_mae = mae;
-                    best_dx = search_dx[s];
-                    best_dy = search_dy[s];
-                    if (mae <= 1.15f * sigma_luma) break;
-                }
-            }
-        }
-
-        // Motion & Occlusion Gate: Reject if residual error exceeds noise limit
-        if (min_mae <= motion_rejection_limit) {
-            int cx = min(max(x + best_dx, 0), width - 1);
-            int cy = min(max(y + best_dy, 0), height - 1);
-            int cand_pixel_idx = cy * stride_floats + cx * 4;
-
-            float norm_err = min_mae / (sigma_luma * temporal_weight + 1e-6f);
-            float w = expf(-0.5f * norm_err * norm_err);
-
-            sum_r += cand_frame[cand_pixel_idx + 0] * w;
-            sum_g += cand_frame[cand_pixel_idx + 1] * w;
-            sum_b += cand_frame[cand_pixel_idx + 2] * w;
-            total_weight += w;
-        }
-    }
-
-    d_temp_accum[pixel_idx + 0] = sum_r / total_weight;
-    d_temp_accum[pixel_idx + 1] = sum_g / total_weight;
-    d_temp_accum[pixel_idx + 2] = sum_b / total_weight;
-    d_temp_accum[pixel_idx + 3] = ref_frame[pixel_idx + 3];
-}
-
-// =========================================================================
-// Kernel 2: 2D 8x8 DCT Frequency Shrinkage (64 threads per 8x8 block)
-// =========================================================================
-__global__ void k_spatial_dct_shrinkage(
-    const float* __restrict__ d_temp_accum,
-    int width,
-    int height,
-    int stride_floats,
     int step_size,
     int channel,
+    float temporal_weight,
     float spatial_weight,
+    float hard_thresh_lambda,
     const float* __restrict__ band_weights,
     float nlf_a,
     float nlf_b,
     float* __restrict__ d_numerator,
     float* __restrict__ d_denominator
 ) {
-    __shared__ float s_patch[8][8];
+    __shared__ float s_group[8][8][8];
     __shared__ float s_temp[8][8];
     __shared__ float s_sigma;
+    __shared__ int s_group_size;
+    __shared__ int s_group_f[8];
+    __shared__ int s_group_dx[8];
+    __shared__ int s_group_dy[8];
+    __shared__ int s_total_non_zero;
+    __shared__ float s_warp_reduce[2];
+
+    int tx = threadIdx.x; // 0..7
+    int ty = threadIdx.y; // 0..7
+    int tid = ty * 8 + tx; // 0..63
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
 
     int bx = blockIdx.x * step_size;
     int by = blockIdx.y * step_size;
@@ -209,90 +86,239 @@ __global__ void k_spatial_dct_shrinkage(
     if (bx + 8 > width) bx = max(0, width - 8);
     if (by + 8 > height) by = max(0, height - 8);
 
-    int tx = threadIdx.x; // 0..7
-    int ty = threadIdx.y; // 0..7
+    int px = min(bx + tx, width - 1);
+    int py = min(by + ty, height - 1);
 
-    int px = bx + tx;
-    int py = by + ty;
+    const float* ref_frame = d_frames[ref_index];
+    float ref_val = ref_frame[py * stride_floats + px * 4 + channel];
+    s_group[0][ty][tx] = ref_val;
 
-    // Load patch into shared memory with edge clamping
-    px = min(px, width - 1);
-    py = min(py, height - 1);
-
-    float val = d_temp_accum[py * stride_floats + px * 4 + channel];
-    s_patch[ty][tx] = val;
-
-    // Center pixel computes block noise sigma
     if (tx == 4 && ty == 4) {
-        float var = fmaxf(0.0f, nlf_a * val + nlf_b);
+        float var = fmaxf(1e-7f, nlf_a * ref_val + nlf_b);
         s_sigma = sqrtf(var) * spatial_weight;
+        s_group_size = 1;
+        s_group_f[0] = ref_index;
+        s_group_dx[0] = 0;
+        s_group_dy[0] = 0;
     }
     __syncthreads();
 
-    // 1D DCT across rows: s_temp[ty][k] = sum_n (c_dct_mat[k][n] * s_patch[ty][n])
-    float row_sum = 0.0f;
+    float trust_dist = 4.0f * (s_sigma * s_sigma + 1e-6f);
+
+    // Form 3D group by cohesive block-matching across temporal frames
+    if (frame_count > 1 && temporal_weight > 0.01f) {
+        for (int f = 0; f < frame_count; ++f) {
+            if (f == ref_index) continue;
+            if (s_group_size >= 8) break;
+
+            const float* cand_frame = d_frames[f];
+
+            // 1. Stationary offset (0, 0) check
+            float cand_v0 = cand_frame[py * stride_floats + px * 4 + channel];
+            float diff0 = ref_val - cand_v0;
+            float sq0 = diff0 * diff0;
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                sq0 += __shfl_down_sync(0xffffffff, sq0, offset);
+            }
+            if (lane_id == 0) s_warp_reduce[warp_id] = sq0;
+            __syncthreads();
+
+            float dist0 = (s_warp_reduce[0] + s_warp_reduce[1]) / 64.0f;
+
+            int best_dx = 0;
+            int best_dy = 0;
+            bool accepted = false;
+
+            if (dist0 <= trust_dist) {
+                best_dx = 0;
+                best_dy = 0;
+                accepted = true;
+            } else {
+                // Coherent block motion search
+                const int num_cands = 8;
+                const int search_dx[8] = { 2, -2,  0,  0,  4, -4,  0,  0 };
+                const int search_dy[8] = { 0,  0,  2, -2,  0,  0,  4, -4 };
+
+                float min_dist = dist0;
+                for (int s = 0; s < num_cands; ++s) {
+                    int cx = min(max(bx + tx + search_dx[s], 0), width - 1);
+                    int cy = min(max(by + ty + search_dy[s], 0), height - 1);
+                    float cv = cand_frame[cy * stride_floats + cx * 4 + channel];
+                    float d = ref_val - cv;
+                    float sq = d * d;
+
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2) {
+                        sq += __shfl_down_sync(0xffffffff, sq, offset);
+                    }
+                    if (lane_id == 0) s_warp_reduce[warp_id] = sq;
+                    __syncthreads();
+
+                    float dist = (s_warp_reduce[0] + s_warp_reduce[1]) / 64.0f;
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        best_dx = search_dx[s];
+                        best_dy = search_dy[s];
+                    }
+                }
+
+                if (min_dist <= trust_dist) {
+                    accepted = true;
+                }
+            }
+
+            if (accepted) {
+                if (tid == 0 && s_group_size < 8) {
+                    int idx = s_group_size++;
+                    s_group_f[idx] = f;
+                    s_group_dx[idx] = best_dx;
+                    s_group_dy[idx] = best_dy;
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    // Load accepted candidate patches into s_group
+    int K = s_group_size;
+    for (int k = 1; k < K; ++k) {
+        int f = s_group_f[k];
+        int dx = s_group_dx[k];
+        int dy = s_group_dy[k];
+        int cx = min(max(bx + tx + dx, 0), width - 1);
+        int cy = min(max(by + ty + dy, 0), height - 1);
+        s_group[k][ty][tx] = d_frames[f][cy * stride_floats + cx * 4 + channel];
+    }
+    __syncthreads();
+
+    // 2D Spatial DCT on each member k in [0, K-1]
+    for (int k = 0; k < K; ++k) {
+        // 1D DCT across rows
+        float r_sum = 0.0f;
+        #pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            r_sum += c_dct_mat[tx][n] * s_group[k][ty][n];
+        }
+        s_temp[ty][tx] = r_sum;
+        __syncthreads();
+
+        // 1D DCT across columns
+        float c_sum = 0.0f;
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            c_sum += c_dct_mat[ty][m] * s_temp[m][tx];
+        }
+        s_group[k][ty][tx] = c_sum;
+        __syncthreads();
+    }
+
+    // 1D Temporal DCT across K members for frequency bin (ty, tx)
+    float temp_in[8];
+    float temp_out[8];
+    for (int k = 0; k < K; ++k) {
+        temp_in[k] = s_group[k][ty][tx];
+    }
+
+    if (K == 1) {
+        temp_out[0] = temp_in[0];
+    } else {
+        float alpha0 = 1.0f / sqrtf(static_cast<float>(K));
+        float alpha = sqrtf(2.0f / static_cast<float>(K));
+        constexpr float pi = 3.141592653589793f;
+        for (int k = 0; k < K; ++k) {
+            float factor = (k == 0) ? alpha0 : alpha;
+            float sum = 0.0f;
+            for (int n = 0; n < K; ++n) {
+                sum += temp_in[n] * cosf((pi / static_cast<float>(K)) * (n + 0.5f) * k);
+            }
+            temp_out[k] = factor * sum;
+        }
+    }
+
+    // Collaborative Hard-Thresholding
+    float r = sqrtf(static_cast<float>(tx * tx + ty * ty));
+    int band = (r < 1.5f) ? 0 : (r < 3.0f) ? 1 : (r < 5.0f) ? 2 : (r < 7.5f) ? 3 : 4;
+    float band_scale = sqrtf(band_weights[band]);
+    float hard_thresh = hard_thresh_lambda * s_sigma * band_scale;
+
+    int thread_nz = 0;
+    for (int k = 0; k < K; ++k) {
+        if (k == 0 && tx == 0 && ty == 0) {
+            // DC of reference patch is always preserved
+            thread_nz++;
+            continue;
+        }
+        float v = temp_out[k];
+        if (fabsf(v) < hard_thresh) {
+            temp_out[k] = 0.0f;
+        } else {
+            thread_nz++;
+        }
+    }
+
+    // Count non-zero coefficients across all 64 threads in the block
+    int nz = thread_nz;
     #pragma unroll
-    for (int n = 0; n < 8; ++n) {
-        row_sum += c_dct_mat[tx][n] * s_patch[ty][n];
+    for (int offset = 16; offset > 0; offset /= 2) {
+        nz += __shfl_down_sync(0xffffffff, nz, offset);
     }
-    s_temp[ty][tx] = row_sum;
+    if (lane_id == 0) s_warp_reduce[warp_id] = static_cast<float>(nz);
+    __syncthreads();
+    if (tid == 0) {
+        s_total_non_zero = max(1, static_cast<int>(s_warp_reduce[0] + s_warp_reduce[1]));
+    }
     __syncthreads();
 
-    // 1D DCT across columns: s_patch[k][tx] = sum_m (c_dct_mat[k][m] * s_temp[m][tx])
-    float col_sum = 0.0f;
-    #pragma unroll
-    for (int m = 0; m < 8; ++m) {
-        col_sum += c_dct_mat[ty][m] * s_temp[m][tx];
+    // Inverse 1D Temporal DCT (extracting reference member n = 0)
+    float inv_temp_0 = 0.0f;
+    if (K == 1) {
+        inv_temp_0 = temp_out[0];
+    } else {
+        float alpha0 = 1.0f / sqrtf(static_cast<float>(K));
+        float alpha = sqrtf(2.0f / static_cast<float>(K));
+        constexpr float pi = 3.141592653589793f;
+        inv_temp_0 = alpha0 * temp_out[0];
+        for (int k = 1; k < K; ++k) {
+            inv_temp_0 += alpha * temp_out[k] * cosf((pi / static_cast<float>(K)) * 0.5f * k);
+        }
     }
-    s_patch[ty][tx] = col_sum;
+    s_group[0][ty][tx] = inv_temp_0;
     __syncthreads();
 
-    // 5-Band Radial Wiener Spectral Shrinkage
-    float coeff = s_patch[ty][tx];
-    if (!(tx == 0 && ty == 0)) { // Preserve DC
-        float r = sqrtf(static_cast<float>(tx * tx + ty * ty));
-        int band = (r < 1.5f) ? 0 : (r < 3.0f) ? 1 : (r < 5.0f) ? 2 : (r < 7.5f) ? 3 : 4;
-        float noise_pwr = (s_sigma * s_sigma) * band_weights[band];
-        float pwr = coeff * coeff;
-        float gain = fmaxf(0.0f, (pwr - noise_pwr) / (pwr + 1e-7f));
-        coeff *= gain;
-    }
-    s_patch[ty][tx] = coeff;
-    __syncthreads();
-
-    // 1D IDCT across columns: s_temp[m][tx] = sum_k (c_dct_mat[k][m] * s_patch[k][tx])
+    // Inverse 2D IDCT on s_group[0]
     float icol_sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        icol_sum += c_dct_mat[k][ty] * s_patch[k][tx];
+        icol_sum += c_dct_mat[k][ty] * s_group[0][k][tx];
     }
     s_temp[ty][tx] = icol_sum;
     __syncthreads();
 
-    // 1D IDCT across rows: s_patch[ty][n] = sum_k (c_dct_mat[k][n] * s_temp[ty][k])
     float irow_sum = 0.0f;
     #pragma unroll
     for (int k = 0; k < 8; ++k) {
         irow_sum += c_dct_mat[k][tx] * s_temp[ty][k];
     }
 
-    // Overlap-add into numerator and denominator buffers
+    // Overlap-add into numerator and denominator buffers with sparsity weighting
+    float weight = 1.0f / static_cast<float>(s_total_non_zero);
     int out_x = bx + tx;
     int out_y = by + ty;
     if (out_x < width && out_y < height) {
         int idx = out_y * width + out_x;
-        atomicAdd(&d_numerator[idx], irow_sum);
-        atomicAdd(&d_denominator[idx], 1.0f);
+        atomicAdd(&d_numerator[idx], irow_sum * weight);
+        atomicAdd(&d_denominator[idx], weight);
     }
 }
 
 // =========================================================================
-// Kernel 3: Post-processing (Normalization, Detail Recovery, Synthetic Grain)
+// Kernel 2: Post-processing Finalize (Gradient Edge Detail, Grain, Mix)
 // =========================================================================
 __global__ void k_postprocess_finalize(
     const float* const* __restrict__ d_frames,
     int ref_index,
-    const float* __restrict__ d_temp_accum,
     const float* __restrict__ d_num_r,
     const float* __restrict__ d_den_r,
     const float* __restrict__ d_num_g,
@@ -322,25 +348,46 @@ __global__ void k_postprocess_finalize(
     const float* nums[3] = {d_num_r, d_num_g, d_num_b};
     const float* dens[3] = {d_den_r, d_den_g, d_den_b};
 
+    int left_x = max(0, x - 1);
+    int right_x = min(width - 1, x + 1);
+    int up_y = max(0, y - 1);
+    int down_y = min(height - 1, y + 1);
+
     for (int c = 0; c < 3; ++c) {
         float ref_val = d_ref_frame[pixel_idx + c];
         float d = dens[c][flat_idx];
-        float filtered = (d > 1e-6f) ? (nums[c][flat_idx] / d) : d_temp_accum[pixel_idx + c];
+        float filtered = (d > 1e-6f) ? (nums[c][flat_idx] / d) : ref_val;
 
-        float sigma = sqrtf(fmaxf(0.0f, nlf_a[c] * ref_val + nlf_b[c]));
+        float var = fmaxf(1e-7f, nlf_a[c] * filtered + nlf_b[c]);
+        float sigma = sqrtf(var);
 
-        // Edge-protected micro-contrast recovery
+        // Edge-protected micro-contrast recovery matching DetailEngine
         if (detail_recovery > 0.0f) {
-            float residual = ref_val - filtered;
-            if (fabsf(residual) > 2.0f * sigma) {
-                filtered += residual * detail_recovery;
+            float d_l = dens[c][y * width + left_x];
+            float d_r = dens[c][y * width + right_x];
+            float d_u = dens[c][up_y * width + x];
+            float d_d = dens[c][down_y * width + x];
+
+            float fl = (d_l > 1e-6f) ? (nums[c][y * width + left_x] / d_l) : d_ref_frame[y * stride_floats + left_x * 4 + c];
+            float fr = (d_r > 1e-6f) ? (nums[c][y * width + right_x] / d_r) : d_ref_frame[y * stride_floats + right_x * 4 + c];
+            float fu = (d_u > 1e-6f) ? (nums[c][up_y * width + x] / d_u) : d_ref_frame[up_y * stride_floats + x * 4 + c];
+            float fd = (d_d > 1e-6f) ? (nums[c][down_y * width + x] / d_d) : d_ref_frame[down_y * stride_floats + x * 4 + c];
+
+            float gx = (fr - fl) * 0.5f;
+            float gy = (fd - fu) * 0.5f;
+            float grad_mag = sqrtf(gx * gx + gy * gy);
+
+            if (grad_mag > 1.5f * sigma) {
+                float residual = ref_val - filtered;
+                float boost = fminf(0.5f, fmaxf(0.0f, detail_recovery * (grad_mag / (grad_mag + sigma))));
+                filtered = fminf(1.0f, fmaxf(0.0f, filtered + boost * residual));
             }
         }
 
         // Calibrated synthetic film grain
         if (grain_amount > 0.0f) {
             float grain = hash_noise(x, y, static_cast<uint32_t>(c * 7919)) * sigma * grain_amount;
-            filtered += grain;
+            filtered = fminf(1.0f, fmaxf(0.0f, filtered + grain));
         }
 
         // Preview Mode: 1 = Residual visual check
@@ -386,8 +433,7 @@ bool cuda_denoise_device(
     const int32_t stride = params.stride_floats;
     const size_t total_pixels = static_cast<size_t>(w * h);
 
-    // Allocate temporary device buffers for temporal accumulator and DCT overlap-add
-    float* d_temp_accum = nullptr;
+    // Allocate device buffers for DCT overlap-add
     float* d_num_r = nullptr;
     float* d_den_r = nullptr;
     float* d_num_g = nullptr;
@@ -398,7 +444,6 @@ bool cuda_denoise_device(
     float* d_nlf_a = nullptr;
     float* d_nlf_b = nullptr;
 
-    cudaMalloc(&d_temp_accum, static_cast<size_t>(stride * h * sizeof(float)));
     cudaMalloc(&d_num_r, total_pixels * sizeof(float));
     cudaMalloc(&d_den_r, total_pixels * sizeof(float));
     cudaMalloc(&d_num_g, total_pixels * sizeof(float));
@@ -421,24 +466,7 @@ bool cuda_denoise_device(
     cudaMemsetAsync(d_num_b, 0, total_pixels * sizeof(float), stream);
     cudaMemsetAsync(d_den_b, 0, total_pixels * sizeof(float), stream);
 
-    // 1. Launch Temporal Pre-filter Kernel
-    dim3 block_2d(16, 16);
-    dim3 grid_pixel((w + block_2d.x - 1) / block_2d.x, (h + block_2d.y - 1) / block_2d.y);
-
-    k_temporal_accumulation<<<grid_pixel, block_2d, 0, stream>>>(
-        d_input_frames,
-        frame_count,
-        ref_index,
-        w,
-        h,
-        stride,
-        params.temporal_weight,
-        d_nlf_a,
-        d_nlf_b,
-        d_temp_accum
-    );
-
-    // 2. Launch 2D DCT Frequency-Domain Shrinkage for each channel
+    // 1. Launch 3D Collaborative Spatiotemporal Filter for each channel
     dim3 block_dct(8, 8);
     const int step = std::max(1, params.step_size);
     dim3 grid_dct((w + step - 1) / step, (h + step - 1) / step);
@@ -447,14 +475,18 @@ bool cuda_denoise_device(
     float* dens[3] = {d_den_r, d_den_g, d_den_b};
 
     for (int c = 0; c < 3; ++c) {
-        k_spatial_dct_shrinkage<<<grid_dct, block_dct, 0, stream>>>(
-            d_temp_accum,
+        k_bm3d_collaborative_filter<<<grid_dct, block_dct, 0, stream>>>(
+            d_input_frames,
+            frame_count,
+            ref_index,
             w,
             h,
             stride,
             step,
             c,
+            params.temporal_weight,
             params.spatial_weight,
+            params.hard_thresh_lambda,
             d_band_weights,
             params.nlf_a[c],
             params.nlf_b[c],
@@ -463,11 +495,13 @@ bool cuda_denoise_device(
         );
     }
 
-    // 3. Launch Post-processing Finalize Kernel
+    // 2. Launch Post-processing Finalize Kernel
+    dim3 block_2d(16, 16);
+    dim3 grid_pixel((w + block_2d.x - 1) / block_2d.x, (h + block_2d.y - 1) / block_2d.y);
+
     k_postprocess_finalize<<<grid_pixel, block_2d, 0, stream>>>(
         d_input_frames,
         ref_index,
-        d_temp_accum,
         d_num_r, d_den_r,
         d_num_g, d_den_g,
         d_num_b, d_den_b,
@@ -490,7 +524,6 @@ bool cuda_denoise_device(
     }
 
     // Free temporary device memory
-    cudaFree(d_temp_accum);
     cudaFree(d_num_r);
     cudaFree(d_den_r);
     cudaFree(d_num_g);

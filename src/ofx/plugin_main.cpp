@@ -971,13 +971,49 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
             if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCr);
         }
 
-        float spatScale = static_cast<float>(spatStrength * spatStrength);
-        cp.nlf_a[0] = static_cast<float>(nlfSlopeY) * spatScale;
-        cp.nlf_b[0] = static_cast<float>(nlfInterceptY) * spatScale;
-        cp.nlf_a[1] = static_cast<float>(nlfSlopeCb) * spatScale * static_cast<float>(chromaCb * chromaCb);
-        cp.nlf_b[1] = static_cast<float>(nlfInterceptCb) * spatScale * static_cast<float>(chromaCb * chromaCb);
-        cp.nlf_a[2] = static_cast<float>(nlfSlopeCr) * spatScale * static_cast<float>(chromaCr * chromaCr);
-        cp.nlf_b[2] = static_cast<float>(nlfInterceptCr) * spatScale * static_cast<float>(chromaCr * chromaCr);
+        // When uncalibrated, dynamically auto-estimate noise from the reference frame
+        if (calibrated == 0.0 && !sourceImages.empty()) {
+            size_t auto_ref_idx = sourceImages.size() / 2;
+            void* refData = nullptr;
+            g_propSuite->propGetPointer(sourceImages[auto_ref_idx], kOfxImagePropData, 0, &refData);
+            int refRowBytes = 0;
+            g_propSuite->propGetInt(sourceImages[auto_ref_idx], kOfxImagePropRowBytes, 0, &refRowBytes);
+
+            if (refData && refRowBytes > 0) {
+                librenoise::VideoFrame32F refF(width, height);
+                int floatStride = refRowBytes / static_cast<int>(sizeof(float));
+                const float* s = reinterpret_cast<const float*>(refData);
+                std::vector<float> h_ref_copy;
+                if (cudaEnabled != 0) {
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+                    h_ref_copy.resize(static_cast<size_t>(floatStride * height));
+                    cudaMemcpy(h_ref_copy.data(), refData, floatStride * height * sizeof(float), cudaMemcpyDeviceToHost);
+                    s = h_ref_copy.data();
+#endif
+                }
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        refF.channels[0].at(x, y) = s[y * floatStride + x * 4 + 0];
+                        refF.channels[1].at(x, y) = s[y * floatStride + x * 4 + 1];
+                        refF.channels[2].at(x, y) = s[y * floatStride + x * 4 + 2];
+                    }
+                }
+                auto autoProf = librenoise::NoiseProfiler::auto_estimate(refF);
+                nlfSlopeY = autoProf.nlf_per_channel[0].a;
+                nlfInterceptY = autoProf.nlf_per_channel[0].b;
+                nlfSlopeCb = autoProf.nlf_per_channel[1].a;
+                nlfInterceptCb = autoProf.nlf_per_channel[1].b;
+                nlfSlopeCr = autoProf.nlf_per_channel[2].a;
+                nlfInterceptCr = autoProf.nlf_per_channel[2].b;
+            }
+        }
+
+        cp.nlf_a[0] = static_cast<float>(nlfSlopeY);
+        cp.nlf_b[0] = static_cast<float>(nlfInterceptY);
+        cp.nlf_a[1] = static_cast<float>(nlfSlopeCb);
+        cp.nlf_b[1] = static_cast<float>(nlfInterceptCb);
+        cp.nlf_a[2] = static_cast<float>(nlfSlopeCr);
+        cp.nlf_b[2] = static_cast<float>(nlfInterceptCr);
         cp.detail_recovery = static_cast<float>(detailRec);
         cp.grain_amount = static_cast<float>(grainAmt);
         cp.mix_original = static_cast<float>(mixWithOriginal);

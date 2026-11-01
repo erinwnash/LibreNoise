@@ -126,10 +126,14 @@ ImagePlane32F compute_temporal_average(
                 int32_t dx = 0, dy = 0;
                 bool trusted = true;
                 if (motion_fields[f]) {
-                    auto mv = motion_fields[f]->get_vector_at_pixel(x, y);
-                    dx = mv.dx;
-                    dy = mv.dy;
-                    trusted = mv.trusted;
+                    if (motion_fields[f]->is_valid()) {
+                        auto mv = motion_fields[f]->get_vector_at_pixel(x, y);
+                        dx = mv.dx;
+                        dy = mv.dy;
+                        trusted = mv.trusted;
+                    } else if (motion_fields[f]->is_scene_cut) {
+                        trusted = false;
+                    }
                 }
                 if (!trusted) continue;
 
@@ -216,10 +220,14 @@ void CollaborativePatchFilter3D::process_plane(
                     int32_t disp_x = 0, disp_y = 0;
                     bool trusted = true;
                     if (motion_fields[f]) {
-                        auto mv = motion_fields[f]->get_vector_at_pixel(x + ps / 2, y + ps / 2);
-                        disp_x = mv.dx;
-                        disp_y = mv.dy;
-                        trusted = mv.trusted;
+                        if (motion_fields[f]->is_valid()) {
+                            auto mv = motion_fields[f]->get_vector_at_pixel(x + ps / 2, y + ps / 2);
+                            disp_x = mv.dx;
+                            disp_y = mv.dy;
+                            trusted = mv.trusted;
+                        } else if (motion_fields[f]->is_scene_cut) {
+                            trusted = false;
+                        }
                     }
                     if (!trusted) continue;
 

@@ -178,6 +178,39 @@ void test_profile_serialization() {
     std::cout << "  -> Passed: .lnp profile saved and reloaded with 100% fidelity.\n";
 }
 
+void test_motion_field_resilience() {
+    std::cout << "[Test] Running MotionField and Scene-Cut resilience test...\n";
+    MotionField empty_mf;
+    assert(!empty_mf.is_valid());
+
+    auto mv = empty_mf.get_vector_at_pixel(100, 200);
+    assert(mv.dx == 0 && mv.dy == 0);
+    assert(mv.trusted == true);
+
+    empty_mf.is_scene_cut = true;
+    auto mv_cut = empty_mf.get_vector_at_pixel(100, 200);
+    assert(mv_cut.trusted == false);
+
+    // Sequence with a hard scene cut
+    const int32_t w = 64;
+    const int32_t h = 64;
+    std::vector<VideoFrame32F> sequence;
+    for (int i = 0; i < 3; ++i) {
+        VideoFrame32F frame(w, h, 1);
+        float base = (i == 1) ? 0.9f : 0.1f; // Frame 1 is completely different (scene cut)
+        frame.channels[0].fill(base);
+        sequence.push_back(frame);
+    }
+
+    VideoDenoiser::Config cfg;
+    cfg.temporal_radius = 1;
+    cfg.match_params.cut_detection_threshold = 0.3f;
+    VideoDenoiser denoiser(cfg);
+    VideoFrame32F result = denoiser.process_window(sequence);
+    assert(result.is_valid());
+    std::cout << "  -> Passed: Uninitialized/cut MotionField handles boundaries safely.\n";
+}
+
 int main() {
     std::cout << "--- Running LibreNoise Core Unit Tests ---\n";
     test_variance_stabilization();
@@ -186,6 +219,7 @@ int main() {
     test_roi_and_profiling();
     test_profile_curve_spline();
     test_profile_serialization();
+    test_motion_field_resilience();
     std::cout << "ALL TESTS PASSED SUCCESSFULLY!\n";
     return 0;
 }

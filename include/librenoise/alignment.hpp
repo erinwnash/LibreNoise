@@ -23,20 +23,46 @@ public:
     MotionField() = default;
     MotionField(int32_t width_blocks, int32_t height_blocks, int32_t block_size)
         : width_blocks_(width_blocks), height_blocks_(height_blocks), block_size_(block_size),
-          vectors_(static_cast<size_t>(width_blocks * height_blocks)) {}
+          vectors_(static_cast<size_t>(std::max(0, width_blocks * height_blocks))) {}
 
     int32_t width_blocks() const noexcept { return width_blocks_; }
     int32_t height_blocks() const noexcept { return height_blocks_; }
     int32_t block_size() const noexcept { return block_size_; }
 
+    bool is_valid() const noexcept { return !vectors_.empty() && width_blocks_ > 0 && height_blocks_ > 0; }
+    bool is_scene_cut = false;
+
     MotionVector& at(int32_t bx, int32_t by) noexcept {
-        return vectors_[static_cast<size_t>(by * width_blocks_ + bx)];
+        if (!is_valid()) {
+            static MotionVector dummy{};
+            return dummy;
+        }
+        size_t idx = static_cast<size_t>(by * width_blocks_ + bx);
+        if (idx >= vectors_.size()) {
+            static MotionVector dummy{};
+            return dummy;
+        }
+        return vectors_[idx];
     }
     const MotionVector& at(int32_t bx, int32_t by) const noexcept {
-        return vectors_[static_cast<size_t>(by * width_blocks_ + bx)];
+        if (!is_valid()) {
+            static const MotionVector dummy{};
+            return dummy;
+        }
+        size_t idx = static_cast<size_t>(by * width_blocks_ + bx);
+        if (idx >= vectors_.size()) {
+            static const MotionVector dummy{};
+            return dummy;
+        }
+        return vectors_[idx];
     }
 
     MotionVector get_vector_at_pixel(int32_t px, int32_t py) const noexcept {
+        if (!is_valid()) {
+            MotionVector mv;
+            mv.trusted = !is_scene_cut;
+            return mv;
+        }
         int32_t bx = std::clamp(px / block_size_, 0, width_blocks_ - 1);
         int32_t by = std::clamp(py / block_size_, 0, height_blocks_ - 1);
         return at(bx, by);

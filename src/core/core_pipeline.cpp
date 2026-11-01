@@ -41,6 +41,7 @@ VideoFrame32F VideoDenoiser::process_window(
 
         // Hard cut detection: if a cut occurs, do not use this candidate
         if (MotionEstimator::is_scene_cut(ref_luma, cand_luma, config_.match_params.cut_detection_threshold)) {
+            motion_fields[i].is_scene_cut = true;
             continue;
         }
 

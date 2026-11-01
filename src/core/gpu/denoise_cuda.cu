@@ -66,10 +66,6 @@ __global__ void k_bm3d_collaborative_filter(
     __shared__ float s_group[8][8][8];
     __shared__ float s_temp[8][8];
     __shared__ float s_sigma;
-    __shared__ int s_group_size;
-    __shared__ int s_group_f[8];
-    __shared__ int s_group_dx[8];
-    __shared__ int s_group_dy[8];
     __shared__ int s_total_non_zero;
     __shared__ float s_warp_reduce[2];
 
@@ -96,102 +92,39 @@ __global__ void k_bm3d_collaborative_filter(
     if (tx == 4 && ty == 4) {
         float var = fmaxf(1e-7f, nlf_a * ref_val + nlf_b);
         s_sigma = sqrtf(var) * spatial_weight;
-        s_group_size = 1;
-        s_group_f[0] = ref_index;
-        s_group_dx[0] = 0;
-        s_group_dy[0] = 0;
     }
     __syncthreads();
 
     float trust_dist = 4.0f * (s_sigma * s_sigma + 1e-6f);
 
     // Form 3D group by cohesive block-matching across temporal frames
+    int K = 1;
     if (frame_count > 1 && temporal_weight > 0.01f) {
         for (int f = 0; f < frame_count; ++f) {
             if (f == ref_index) continue;
-            if (s_group_size >= 8) break;
+            if (K >= 8) break;
 
             const float* cand_frame = d_frames[f];
-
-            // 1. Stationary offset (0, 0) check
-            float cand_v0 = cand_frame[py * stride_floats + px * 4 + channel];
-            float diff0 = ref_val - cand_v0;
-            float sq0 = diff0 * diff0;
+            float cand_v = cand_frame[py * stride_floats + px * 4 + channel];
+            float diff = ref_val - cand_v;
+            float sq = diff * diff;
 
             #pragma unroll
             for (int offset = 16; offset > 0; offset /= 2) {
-                sq0 += __shfl_down_sync(0xffffffff, sq0, offset);
+                sq += __shfl_down_sync(0xffffffff, sq, offset);
             }
-            if (lane_id == 0) s_warp_reduce[warp_id] = sq0;
+            if (lane_id == 0) s_warp_reduce[warp_id] = sq;
             __syncthreads();
 
-            float dist0 = (s_warp_reduce[0] + s_warp_reduce[1]) / 64.0f;
+            float dist = (s_warp_reduce[0] + s_warp_reduce[1]) / 64.0f;
 
-            int best_dx = 0;
-            int best_dy = 0;
-            bool accepted = false;
-
-            if (dist0 <= trust_dist) {
-                best_dx = 0;
-                best_dy = 0;
-                accepted = true;
-            } else {
-                // Coherent block motion search
-                const int num_cands = 8;
-                const int search_dx[8] = { 2, -2,  0,  0,  4, -4,  0,  0 };
-                const int search_dy[8] = { 0,  0,  2, -2,  0,  0,  4, -4 };
-
-                float min_dist = dist0;
-                for (int s = 0; s < num_cands; ++s) {
-                    int cx = min(max(bx + tx + search_dx[s], 0), width - 1);
-                    int cy = min(max(by + ty + search_dy[s], 0), height - 1);
-                    float cv = cand_frame[cy * stride_floats + cx * 4 + channel];
-                    float d = ref_val - cv;
-                    float sq = d * d;
-
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset /= 2) {
-                        sq += __shfl_down_sync(0xffffffff, sq, offset);
-                    }
-                    if (lane_id == 0) s_warp_reduce[warp_id] = sq;
-                    __syncthreads();
-
-                    float dist = (s_warp_reduce[0] + s_warp_reduce[1]) / 64.0f;
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        best_dx = search_dx[s];
-                        best_dy = search_dy[s];
-                    }
-                }
-
-                if (min_dist <= trust_dist) {
-                    accepted = true;
-                }
+            if (dist <= trust_dist) {
+                s_group[K][ty][tx] = cand_v;
+                K++;
             }
-
-            if (accepted) {
-                if (tid == 0 && s_group_size < 8) {
-                    int idx = s_group_size++;
-                    s_group_f[idx] = f;
-                    s_group_dx[idx] = best_dx;
-                    s_group_dy[idx] = best_dy;
-                }
-                __syncthreads();
-            }
+            __syncthreads();
         }
     }
-
-    // Load accepted candidate patches into s_group
-    int K = s_group_size;
-    for (int k = 1; k < K; ++k) {
-        int f = s_group_f[k];
-        int dx = s_group_dx[k];
-        int dy = s_group_dy[k];
-        int cx = min(max(bx + tx + dx, 0), width - 1);
-        int cy = min(max(by + ty + dy, 0), height - 1);
-        s_group[k][ty][tx] = d_frames[f][cy * stride_floats + cx * 4 + channel];
-    }
-    __syncthreads();
 
     // 2D Spatial DCT on each member k in [0, K-1]
     for (int k = 0; k < K; ++k) {
@@ -301,6 +234,7 @@ __global__ void k_bm3d_collaborative_filter(
     for (int k = 0; k < 8; ++k) {
         irow_sum += c_dct_mat[k][tx] * s_temp[ty][k];
     }
+    irow_sum = fmaxf(0.0f, irow_sum);
 
     // Overlap-add into numerator and denominator buffers with sparsity weighting
     float weight = 1.0f / static_cast<float>(s_total_non_zero);

@@ -9,6 +9,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MSVC)
+    # Maintain full binary ABI compatibility when loaded into VFX hosts (Nuke 13-15, AE, Resolve)
+    # that bundle pre-14.40 MSVCP140.dll in their application directory.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+endif()
+
 # CUDA Toolkit Detection
 find_package(CUDAToolkit)
 if(CUDAToolkit_FOUND)

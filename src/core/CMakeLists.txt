@@ -22,6 +22,7 @@ if(LIBRENOISE_HAS_CUDA)
             -o ${CUDA_OBJ}
             -O3
             -allow-unsupported-compiler
+            -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
             -arch=sm_86
             -Xcompiler="/MD"
             -ccbin "${CMAKE_CXX_COMPILER}"

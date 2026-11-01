@@ -4,8 +4,17 @@
 #include <device_launch_parameters.h>
 #include <cmath>
 #include <algorithm>
-#include <mutex>
+#include <atomic>
 #include <vector>
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace librenoise {
 
@@ -103,6 +112,10 @@ struct GpuScratchArena {
     }
 
     void release() {
+        // Fast no-op when no GPU scratch memory was ever allocated (e.g., during host startup plugin scan)
+        if (d_luma == nullptr && alloc_pixels == 0) {
+            return;
+        }
         int dev = 0;
         cudaError_t state = cudaGetDevice(&dev);
         bool runtime_alive = (state == cudaSuccess);
@@ -141,7 +154,26 @@ struct GpuScratchArena {
     }
 };
 
-static std::mutex g_cuda_mutex;
+// Zero-CRT-dependency lock (avoids MSVCP140.dll!_Mtx_lock ABI mismatch in hosts shipping older MSVC runtimes)
+struct GpuArenaLock {
+#if defined(_WIN32)
+    SRWLOCK srw = SRWLOCK_INIT;
+    void lock() noexcept { AcquireSRWLockExclusive(&srw); }
+    void unlock() noexcept { ReleaseSRWLockExclusive(&srw); }
+#else
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+    void lock() noexcept { while (flag.test_and_set(std::memory_order_acquire)) {} }
+    void unlock() noexcept { flag.clear(std::memory_order_release); }
+#endif
+};
+
+struct GpuScopedLock {
+    GpuArenaLock& m;
+    explicit GpuScopedLock(GpuArenaLock& mtx) noexcept : m(mtx) { m.lock(); }
+    ~GpuScopedLock() noexcept { m.unlock(); }
+};
+
+static GpuArenaLock g_cuda_lock;
 static GpuScratchArena g_arena;
 
 void init_dct_constants() {
@@ -1505,7 +1537,7 @@ bool is_cuda_available() noexcept {
 }
 
 void release_cuda_resources() noexcept {
-    std::lock_guard<std::mutex> lock(g_cuda_mutex);
+    GpuScopedLock lock(g_cuda_lock);
     g_arena.release();
 }
 
@@ -1524,7 +1556,7 @@ bool cuda_denoise_device(
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(g_cuda_mutex);
+    GpuScopedLock lock(g_cuda_lock);
     cudaStream_t stream = cuda_stream ? reinterpret_cast<cudaStream_t>(cuda_stream) : nullptr;
 
     init_dct_constants();

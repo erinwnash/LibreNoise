@@ -202,6 +202,10 @@ PF_Err handle_render(
         cp.spatial_weight = 1.0f;
         cp.detail_recovery = 0.15f;
         cp.grain_amount = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            cp.nlf_a[i] = 0.00035f;
+            cp.nlf_b[i] = 0.00003f;
+        }
 
         // Process via GPU
         size_t frameBytes = static_cast<size_t>(rowbytes * height);

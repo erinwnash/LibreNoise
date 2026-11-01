@@ -88,6 +88,15 @@ constexpr const char* kParamDetailRecovery     = "detailRecovery";
 constexpr const char* kParamGrainAmount        = "grainAmount";
 constexpr const char* kParamPreviewMode        = "previewMode";
 
+// Calibration Persistence (Secret Parameters)
+constexpr const char* kParamCalibrated          = "profileCalibrated";
+constexpr const char* kParamNlfSlopeY           = "nlfSlopeY";
+constexpr const char* kParamNlfInterceptY       = "nlfInterceptY";
+constexpr const char* kParamNlfSlopeCb          = "nlfSlopeCb";
+constexpr const char* kParamNlfInterceptCb      = "nlfInterceptCb";
+constexpr const char* kParamNlfSlopeCr          = "nlfSlopeCr";
+constexpr const char* kParamNlfInterceptCr      = "nlfInterceptCr";
+
 // Performance Toggles
 constexpr const char* kParamFastChroma         = "fastChroma";
 constexpr const char* kParamFastDct            = "fastDct";
@@ -455,6 +464,24 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
 
+    // =========================================================================
+    // Secret Statistical State Parameters (Stored with Host Project)
+    // =========================================================================
+    auto define_secret_double = [&](const char* name, double default_val) {
+        OfxPropertySetHandle sp = nullptr;
+        g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, name, &sp);
+        g_propSuite->propSetInt(sp, kOfxParamPropSecret, 0, 1);
+        g_propSuite->propSetDouble(sp, kOfxParamPropDefault, 0, default_val);
+    };
+
+    define_secret_double(kParamCalibrated, 0.0);
+    define_secret_double(kParamNlfSlopeY, 0.00035);
+    define_secret_double(kParamNlfInterceptY, 0.00003);
+    define_secret_double(kParamNlfSlopeCb, 0.00030);
+    define_secret_double(kParamNlfInterceptCb, 0.000025);
+    define_secret_double(kParamNlfSlopeCr, 0.00030);
+    define_secret_double(kParamNlfInterceptCr, 0.000025);
+
     return kOfxStatOK;
 }
 
@@ -600,6 +627,20 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
                     g_paramSuite->paramSetValue(bH, static_cast<double>(result.measured_psd[3]));
                 if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &bVH, nullptr) == kOfxStatOK)
                     g_paramSuite->paramSetValue(bVH, static_cast<double>(result.measured_psd[4]));
+
+                auto set_secret_val = [&](const char* sname, double sval) {
+                    OfxParamHandle sh = nullptr;
+                    if (g_paramSuite->paramGetHandle(paramSet, sname, &sh, nullptr) == kOfxStatOK && sh) {
+                        g_paramSuite->paramSetValue(sh, sval);
+                    }
+                };
+                set_secret_val(kParamCalibrated, 1.0);
+                set_secret_val(kParamNlfSlopeY, static_cast<double>(result.nlf_y.a));
+                set_secret_val(kParamNlfInterceptY, static_cast<double>(result.nlf_y.b));
+                set_secret_val(kParamNlfSlopeCb, static_cast<double>(result.nlf_cb.a));
+                set_secret_val(kParamNlfInterceptCb, static_cast<double>(result.nlf_cb.b));
+                set_secret_val(kParamNlfSlopeCr, static_cast<double>(result.nlf_cr.a));
+                set_secret_val(kParamNlfInterceptCr, static_cast<double>(result.nlf_cr.b));
             }
         }
         return kOfxStatOK;
@@ -647,6 +688,20 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
                 g_paramSuite->paramSetValue(bH, static_cast<double>(result.measured_psd[3]));
             if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &bVH, nullptr) == kOfxStatOK)
                 g_paramSuite->paramSetValue(bVH, static_cast<double>(result.measured_psd[4]));
+
+            auto set_secret_val = [&](const char* sname, double sval) {
+                OfxParamHandle sh = nullptr;
+                if (g_paramSuite->paramGetHandle(paramSet, sname, &sh, nullptr) == kOfxStatOK && sh) {
+                    g_paramSuite->paramSetValue(sh, sval);
+                }
+            };
+            set_secret_val(kParamCalibrated, 1.0);
+            set_secret_val(kParamNlfSlopeY, static_cast<double>(result.nlf_y.a));
+            set_secret_val(kParamNlfInterceptY, static_cast<double>(result.nlf_y.b));
+            set_secret_val(kParamNlfSlopeCb, static_cast<double>(result.nlf_cb.a));
+            set_secret_val(kParamNlfInterceptCb, static_cast<double>(result.nlf_cb.b));
+            set_secret_val(kParamNlfSlopeCr, static_cast<double>(result.nlf_cr.a));
+            set_secret_val(kParamNlfInterceptCr, static_cast<double>(result.nlf_cr.b));
         }
         return kOfxStatOK;
     }
@@ -687,6 +742,20 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
                     if (g_paramSuite->paramGetHandle(paramSet, kParamTonalLightMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[3].y));
                     if (g_paramSuite->paramGetHandle(paramSet, kParamTonalHighlights, &p, nullptr) == kOfxStatOK) g_paramSuite->paramSetValue(p, static_cast<double>(pts[4].y));
                 }
+
+                auto set_secret_val = [&](const char* sname, double sval) {
+                    OfxParamHandle sh = nullptr;
+                    if (g_paramSuite->paramGetHandle(paramSet, sname, &sh, nullptr) == kOfxStatOK && sh) {
+                        g_paramSuite->paramSetValue(sh, sval);
+                    }
+                };
+                set_secret_val(kParamCalibrated, 1.0);
+                set_secret_val(kParamNlfSlopeY, static_cast<double>(prof.nlf_y.a));
+                set_secret_val(kParamNlfInterceptY, static_cast<double>(prof.nlf_y.b));
+                set_secret_val(kParamNlfSlopeCb, static_cast<double>(prof.nlf_cb.a));
+                set_secret_val(kParamNlfInterceptCb, static_cast<double>(prof.nlf_cb.b));
+                set_secret_val(kParamNlfSlopeCr, static_cast<double>(prof.nlf_cr.a));
+                set_secret_val(kParamNlfInterceptCr, static_cast<double>(prof.nlf_cr.b));
             }
         }
         return kOfxStatOK;
@@ -887,10 +956,28 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         cp.band_weights[2] = static_cast<float>(bandM);
         cp.band_weights[3] = static_cast<float>(bandH);
         cp.band_weights[4] = static_cast<float>(bandVH);
-        for (int i = 0; i < 3; ++i) {
-            cp.nlf_a[i] = 0.0012f;
-            cp.nlf_b[i] = 0.0001f;
+        double calibrated = 0.0;
+        double nlfSlopeY = 0.00035, nlfInterceptY = 0.00003;
+        double nlfSlopeCb = 0.00030, nlfInterceptCb = 0.000025;
+        double nlfSlopeCr = 0.00030, nlfInterceptCr = 0.000025;
+        if (paramSet) {
+            OfxParamHandle hp = nullptr;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamCalibrated, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &calibrated);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeY);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptY);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCb);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCb);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCr);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCr);
         }
+
+        float spatScale = static_cast<float>(spatStrength * spatStrength);
+        cp.nlf_a[0] = static_cast<float>(nlfSlopeY) * spatScale;
+        cp.nlf_b[0] = static_cast<float>(nlfInterceptY) * spatScale;
+        cp.nlf_a[1] = static_cast<float>(nlfSlopeCb) * spatScale * static_cast<float>(chromaCb * chromaCb);
+        cp.nlf_b[1] = static_cast<float>(nlfInterceptCb) * spatScale * static_cast<float>(chromaCb * chromaCb);
+        cp.nlf_a[2] = static_cast<float>(nlfSlopeCr) * spatScale * static_cast<float>(chromaCr * chromaCr);
+        cp.nlf_b[2] = static_cast<float>(nlfInterceptCr) * spatScale * static_cast<float>(chromaCr * chromaCr);
         cp.detail_recovery = static_cast<float>(detailRec);
         cp.grain_amount = static_cast<float>(grainAmt);
         cp.mix_original = static_cast<float>(mixWithOriginal);

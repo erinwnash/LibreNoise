@@ -17,6 +17,17 @@
 #include <iomanip>
 #include <string>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 namespace {
 
 using namespace librenoise;
@@ -163,7 +174,7 @@ bool load_dpx_frame(const std::filesystem::path& path, VideoFrame32F& out_frame,
     return true;
 }
 
-int run_dpx_benchmark(const std::string& dpx_arg) {
+int run_dpx_benchmark(const std::string& dpx_arg, bool include_cpu) {
     std::vector<std::filesystem::path> files;
     std::filesystem::path p(dpx_arg);
     if (std::filesystem::is_directory(p)) {
@@ -212,6 +223,8 @@ int run_dpx_benchmark(const std::string& dpx_arg) {
     std::cout << "    Measured ROI Sigma (R/G/B): " << std::setprecision(5)
               << roi_res.sigma_y << " / " << roi_res.sigma_cb << " / " << roi_res.sigma_cr << "\n";
 
+    VideoFrame32F gpu_out;
+
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
     if (is_cuda_available()) {
         size_t fbytes = static_cast<size_t>(W) * H * 4 * sizeof(float);
@@ -250,7 +263,7 @@ int run_dpx_benchmark(const std::string& dpx_arg) {
         std::vector<float> h_out(static_cast<size_t>(W) * H * 4);
         cudaMemcpy(h_out.data(), d_out, fbytes, cudaMemcpyDeviceToHost);
 
-        VideoFrame32F gpu_out(W, H, 3);
+        gpu_out = VideoFrame32F(W, H, 3);
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 size_t idx = static_cast<size_t>(y) * W + x;
@@ -269,16 +282,64 @@ int run_dpx_benchmark(const std::string& dpx_arg) {
         release_cuda_resources();
     }
 #endif
+
+    if (include_cpu) {
+        // Free duplicate packed RGBA staging buffers before measuring Track A CPU footprint
+        rgba.clear();
+        rgba.shrink_to_fit();
+
+        VideoDenoiser::Config cfg;
+        cfg.temporal_radius = static_cast<int32_t>(ref_idx);
+        cfg.filter_params.engine = DenoiseEngine::Collaborative3D;
+        cfg.filter_params.quality = QualityPreset::Balanced;
+        cfg.detail_params.detail_recovery = 0.15f;
+        VideoDenoiser cpu_denoiser(cfg);
+
+        auto c0 = std::chrono::high_resolution_clock::now();
+        VideoFrame32F cpu_out = cpu_denoiser.process_window(frames, &auto_prof);
+        auto c1 = std::chrono::high_resolution_clock::now();
+        double cpu_ms = std::chrono::duration<double, std::milli>(c1 - c0).count();
+
+        auto cpu_roi_res = NoiseRoiAnalyzer::analyze_roi(cpu_out, opt_roi);
+        std::cout << "[*] Full-Frame AVX2 CPU Denoise (" << W << "x" << H << ", " << count << " frames): "
+                  << std::setprecision(1) << cpu_ms << " ms\n";
+        std::cout << "    Post-CPU Residual Sigma (R/G/B): " << std::setprecision(5)
+                  << cpu_roi_res.sigma_y << " / " << cpu_roi_res.sigma_cb << " / " << cpu_roi_res.sigma_cr << "\n";
+
+        if (gpu_out.is_valid()) {
+            double parity_psnr = compute_psnr(cpu_out.channels[0], gpu_out.channels[0]);
+            std::cout << "    Full-4K CPU vs GPU Agreement PSNR (R): " << std::setprecision(2) << parity_psnr << " dB\n";
+        }
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+            double peak_ws_mb = static_cast<double>(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0);
+            double priv_mb = static_cast<double>(pmc.PrivateUsage) / (1024.0 * 1024.0);
+            std::cout << "    Process Memory -> Peak Working Set: " << std::setprecision(1) << peak_ws_mb
+                      << " MB | Current Commit: " << priv_mb << " MB\n";
+        }
+#endif
+    }
+
     return 0;
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--dpx") {
-            return run_dpx_benchmark(argv[i + 1]);
+    std::string dpx_path;
+    bool dpx_cpu = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--dpx" && i + 1 < argc) {
+            dpx_path = argv[++i];
+        } else if (a == "--cpu") {
+            dpx_cpu = true;
         }
+    }
+    if (!dpx_path.empty()) {
+        return run_dpx_benchmark(dpx_path, dpx_cpu);
     }
     std::cout << "====================================================================\n";
     std::cout << " LibreNoise Multi-Engine Comparative Benchmark v" << LIBRENOISE_VERSION_STRING << "\n";

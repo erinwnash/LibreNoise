@@ -6,6 +6,12 @@ add_library(librenoise_ofx MODULE
 target_link_libraries(librenoise_ofx PRIVATE librenoise_core)
 target_compile_features(librenoise_ofx PRIVATE cxx_std_20)
 
+if(MSVC)
+    target_compile_options(librenoise_ofx PRIVATE /arch:AVX2 /fp:fast /openmp)
+else()
+    target_compile_options(librenoise_ofx PRIVATE -mavx2 -mfma -ffast-math -fopenmp)
+endif()
+
 if(WIN32)
     target_link_libraries(librenoise_ofx PRIVATE opengl32)
 elseif(APPLE)
@@ -45,3 +51,13 @@ add_custom_command(TARGET librenoise_ofx POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:librenoise_ofx>" "${BUNDLE_DIR}/LibreNoise.ofx"
     COMMENT "Packaging LibreNoise into standard OpenFX bundle (${BUNDLE_DIR})"
 )
+
+if(WIN32 AND LIBRENOISE_HAS_CUDA)
+    file(GLOB CUDART_DLLS "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
+    foreach(CUDART_DLL ${CUDART_DLLS})
+        add_custom_command(TARGET librenoise_ofx POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CUDART_DLL}" "${BUNDLE_DIR}/"
+            COMMENT "Bundling CUDA runtime DLL (${CUDART_DLL}) into OpenFX bundle"
+        )
+    endforeach()
+endif()

@@ -84,6 +84,7 @@ public:
         float cut_detection_threshold = 0.35f; // SAD ratio indicating scene cut
         bool enable_subpixel = true;
         bool early_exit = true; // Early termination if center match is below noise floor
+        int32_t max_threads = 0; // 0 = polite hardware auto-cap
     };
 
     /**

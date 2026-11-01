@@ -21,10 +21,19 @@
 #include <iostream>
 #include <string>
 #include <optional>
+#include <thread>
 
 #if defined(_WIN32) || defined(__WIN32__)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #define OFX_EXPORT __declspec(dllexport)
 #else
+#include <pthread.h>
 #define OFX_EXPORT __attribute__((visibility("default")))
 #endif
 
@@ -102,6 +111,48 @@ constexpr const char* kParamFastChroma         = "fastChroma";
 constexpr const char* kParamFastDct            = "fastDct";
 constexpr const char* kParamEarlyExitMotion    = "earlyExitMotion";
 
+// Host background worker state & OS-native CPU render serialization (0 MSVCP140 ABI dependency)
+int g_isBackgroundHost = 0;
+
+struct CpuRenderLock {
+#if defined(_WIN32) || defined(__WIN32__)
+    SRWLOCK lock = SRWLOCK_INIT;
+    void acquire() noexcept { AcquireSRWLockExclusive(&lock); }
+    void release() noexcept { ReleaseSRWLockExclusive(&lock); }
+#else
+    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    void acquire() noexcept { pthread_mutex_lock(&lock); }
+    void release() noexcept { pthread_mutex_unlock(&lock); }
+#endif
+};
+static CpuRenderLock g_cpuRenderLock;
+
+struct ScopedCpuRenderLock {
+    CpuRenderLock& m;
+    explicit ScopedCpuRenderLock(CpuRenderLock& l) noexcept : m(l) { m.acquire(); }
+    ~ScopedCpuRenderLock() noexcept { m.release(); }
+};
+
+inline int compute_polite_cpu_threads() noexcept {
+    int hw = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw <= 0) hw = 8;
+    if (g_isBackgroundHost != 0) {
+        // Multi-worker FrameServer / render-farm child process: share cores cleanly across workers
+        return std::clamp(hw / 4, 2, 6);
+    }
+    // Interactive host GUI: keep 25% of logical cores free for UI, viewer, & FrameServer broker
+    return std::clamp((hw * 3) / 4, 2, 16);
+}
+
+inline bool is_ofx_aborted(OfxImageEffectHandle effect) noexcept {
+    return (effect != nullptr && g_effectSuite != nullptr &&
+            g_effectSuite->abort != nullptr && g_effectSuite->abort(effect) != 0);
+}
+
+bool ofx_abort_trampoline(void* user_data) {
+    return is_ofx_aborted(reinterpret_cast<OfxImageEffectHandle>(user_data));
+}
+
 // Action: Load
 OfxStatus action_load() {
     if (!g_host || !g_host->host || !g_host->fetchSuite) return kOfxStatErrFatal;
@@ -112,6 +163,7 @@ OfxStatus action_load() {
     if (!g_propSuite || !g_paramSuite || !g_effectSuite) {
         return kOfxStatErrMissingHostFeature;
     }
+    g_propSuite->propGetInt(g_host->host, kOfxImageEffectHostPropIsBackground, 0, &g_isBackgroundHost);
     return kOfxStatOK;
 }
 
@@ -181,6 +233,24 @@ inline void sample_ofx_pixel_rgba(const OfxImgInfo& info, int world_x, int world
             out_rgba[0] = out_rgba[1] = out_rgba[2] = p[0] * inv8;
         }
     }
+}
+
+inline float sample_ofx_alpha(const OfxImgInfo& info, int world_x, int world_y) noexcept {
+    if (info.channels < 4) return 1.0f;
+    int sx = std::clamp(world_x, info.bounds[0], info.bounds[2] - 1) - info.bounds[0];
+    int sy = std::clamp(world_y, info.bounds[1], info.bounds[3] - 1) - info.bounds[1];
+    const auto* row_ptr = reinterpret_cast<const uint8_t*>(info.data) +
+                          static_cast<ptrdiff_t>(sy) * static_cast<ptrdiff_t>(info.rowBytes);
+    if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthFloat) == 0) {
+        return (reinterpret_cast<const float*>(row_ptr) + sx * info.channels)[3];
+    }
+    if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthShort) == 0) {
+        return static_cast<float>((reinterpret_cast<const uint16_t*>(row_ptr) + sx * info.channels)[3]) * (1.0f / 65535.0f);
+    }
+    if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthByte) == 0) {
+        return static_cast<float>((row_ptr + sx * info.channels)[3]) * (1.0f / 255.0f);
+    }
+    return 1.0f;
 }
 
 // Action: Describe
@@ -635,7 +705,9 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
 
         int width = info.width();
         int height = info.height();
+        const int cpuThreads = compute_polite_cpu_threads();
         FetchedFrame result{librenoise::VideoFrame32F(width, height), info.bounds[0], info.bounds[1]};
+        #pragma omp parallel for schedule(static) num_threads(cpuThreads)
         for (int y = 0; y < height; ++y) {
             for (int x = 0; x < width; ++x) {
                 float rgba[4];
@@ -1019,38 +1091,63 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         }
     }
 
-    if (sourceImages.empty()) {
+    auto release_all_clips = [&]() {
+        for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
         g_effectSuite->clipReleaseImage(outImage);
+    };
+
+    if (sourceImages.empty() || is_ofx_aborted(effect)) {
+        release_all_clips();
         return kOfxStatOK;
     }
 
-    // Resolve Unified Noise Profile (shared identically between GPU Track B and CPU Track A)
-    librenoise::NoiseProfile activeProfile;
-    if (calibrated != 0.0) {
-        activeProfile.profile_name = "CalibratedSensor";
-        activeProfile.nlf_per_channel[0] = {static_cast<float>(nlfSlopeY), static_cast<float>(nlfInterceptY)};
-        activeProfile.nlf_per_channel[1] = {static_cast<float>(nlfSlopeCb), static_cast<float>(nlfInterceptCb)};
-        activeProfile.nlf_per_channel[2] = {static_cast<float>(nlfSlopeCr), static_cast<float>(nlfInterceptCr)};
-        // Calibrated 5-band PSD is already stored in user-editable bandVL..bandVH sliders
-    } else {
-        size_t auto_ref_idx = srcInfos.size() / 2;
-        const OfxImgInfo& refInfo = srcInfos[auto_ref_idx];
-        int rw = refInfo.width();
-        int rh = refInfo.height();
-        librenoise::VideoFrame32F refF(rw, rh);
+    const int cpuThreads = compute_polite_cpu_threads();
+    bool canUseCuda = (accelMode != 2 && librenoise::is_cuda_available());
 
-        if (cudaEnabled != 0) {
+    // =========================================================================
+    // Track B: GPU Acceleration Pipeline (CUDA sm_86)
+    // =========================================================================
+    if (canUseCuda) {
+        librenoise::NoiseProfile activeProfile;
+        if (calibrated != 0.0) {
+            activeProfile.profile_name = "CalibratedSensor";
+            activeProfile.nlf_per_channel[0] = {static_cast<float>(nlfSlopeY), static_cast<float>(nlfInterceptY)};
+            activeProfile.nlf_per_channel[1] = {static_cast<float>(nlfSlopeCb), static_cast<float>(nlfInterceptCb)};
+            activeProfile.nlf_per_channel[2] = {static_cast<float>(nlfSlopeCr), static_cast<float>(nlfInterceptCr)};
+        } else {
+            size_t auto_ref_idx = srcInfos.size() / 2;
+            const OfxImgInfo& refInfo = srcInfos[auto_ref_idx];
+            int rw = refInfo.width();
+            int rh = refInfo.height();
+            librenoise::VideoFrame32F refF(rw, rh);
+
+            if (cudaEnabled != 0) {
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-            size_t totalBytes = static_cast<size_t>(std::abs(refInfo.rowBytes)) * static_cast<size_t>(rh);
-            std::vector<uint8_t> h_copy(totalBytes);
-            if (cudaMemcpy(h_copy.data(), refInfo.data, totalBytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
-                OfxImgInfo hostRef = refInfo;
-                hostRef.data = h_copy.data();
-                hostRef.rowBytes = std::abs(refInfo.rowBytes);
+                size_t totalBytes = static_cast<size_t>(std::abs(refInfo.rowBytes)) * static_cast<size_t>(rh);
+                std::vector<uint8_t> h_copy(totalBytes);
+                if (cudaMemcpy(h_copy.data(), refInfo.data, totalBytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                    OfxImgInfo hostRef = refInfo;
+                    hostRef.data = h_copy.data();
+                    hostRef.rowBytes = std::abs(refInfo.rowBytes);
+                    #pragma omp parallel for schedule(static) num_threads(cpuThreads)
+                    for (int y = 0; y < rh; ++y) {
+                        for (int x = 0; x < rw; ++x) {
+                            float rgba[4];
+                            sample_ofx_pixel_rgba(hostRef, hostRef.bounds[0] + x, hostRef.bounds[1] + y, rgba);
+                            refF.channels[0].at(x, y) = rgba[0];
+                            refF.channels[1].at(x, y) = rgba[1];
+                            refF.channels[2].at(x, y) = rgba[2];
+                        }
+                    }
+                    activeProfile = librenoise::NoiseProfiler::auto_estimate(refF);
+                }
+#endif
+            } else {
+                #pragma omp parallel for schedule(static) num_threads(cpuThreads)
                 for (int y = 0; y < rh; ++y) {
                     for (int x = 0; x < rw; ++x) {
                         float rgba[4];
-                        sample_ofx_pixel_rgba(hostRef, hostRef.bounds[0] + x, hostRef.bounds[1] + y, rgba);
+                        sample_ofx_pixel_rgba(refInfo, refInfo.bounds[0] + x, refInfo.bounds[1] + y, rgba);
                         refF.channels[0].at(x, y) = rgba[0];
                         refF.channels[1].at(x, y) = rgba[1];
                         refF.channels[2].at(x, y) = rgba[2];
@@ -1058,27 +1155,8 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 }
                 activeProfile = librenoise::NoiseProfiler::auto_estimate(refF);
             }
-#endif
-        } else {
-            for (int y = 0; y < rh; ++y) {
-                for (int x = 0; x < rw; ++x) {
-                    float rgba[4];
-                    sample_ofx_pixel_rgba(refInfo, refInfo.bounds[0] + x, refInfo.bounds[1] + y, rgba);
-                    refF.channels[0].at(x, y) = rgba[0];
-                    refF.channels[1].at(x, y) = rgba[1];
-                    refF.channels[2].at(x, y) = rgba[2];
-                }
-            }
-            activeProfile = librenoise::NoiseProfiler::auto_estimate(refF);
         }
-    }
 
-    // =========================================================================
-    // Track B: GPU Acceleration Pipeline (CUDA sm_86)
-    // =========================================================================
-    bool canUseCuda = (accelMode != 2 && librenoise::is_cuda_available());
-
-    if (canUseCuda) {
         librenoise::CudaDenoiseParams cp;
         cp.width = width;
         cp.height = height;
@@ -1189,7 +1267,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 if (isExactRgba32F) {
                     cudaMemcpy(d_alloc_ptrs[i], si.data, packedBytes, cudaMemcpyHostToDevice);
                 } else {
-                    #pragma omp parallel for schedule(static)
+                    #pragma omp parallel for schedule(static) num_threads(cpuThreads)
                     for (int y = 0; y < height; ++y) {
                         int wy = outInfo.bounds[1] + y;
                         float* dst_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
@@ -1230,7 +1308,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                         cudaMemcpy(h_stage.data(), d_out_buf, packedBytes, cudaMemcpyDeviceToHost);
                         const int outCh = outInfo.channels;
                         if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0) {
-                            #pragma omp parallel for schedule(static)
+                            #pragma omp parallel for schedule(static) num_threads(cpuThreads)
                             for (int y = 0; y < height; ++y) {
                                 auto* dst_row = reinterpret_cast<float*>(
                                     reinterpret_cast<uint8_t*>(outInfo.data) +
@@ -1248,7 +1326,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                                 }
                             }
                         } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthShort) == 0) {
-                            #pragma omp parallel for schedule(static)
+                            #pragma omp parallel for schedule(static) num_threads(cpuThreads)
                             for (int y = 0; y < height; ++y) {
                                 auto* dst_row = reinterpret_cast<uint16_t*>(
                                     reinterpret_cast<uint8_t*>(outInfo.data) +
@@ -1261,7 +1339,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                                 }
                             }
                         } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthByte) == 0) {
-                            #pragma omp parallel for schedule(static)
+                            #pragma omp parallel for schedule(static) num_threads(cpuThreads)
                             for (int y = 0; y < height; ++y) {
                                 auto* dst_row = reinterpret_cast<uint8_t*>(outInfo.data) +
                                                 static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes);
@@ -1280,8 +1358,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 for (auto ptr : d_alloc_ptrs) if (ptr) cudaFree(ptr);
 
                 if (ok) {
-                    for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
-                    g_effectSuite->clipReleaseImage(outImage);
+                    release_all_clips();
                     return kOfxStatOK;
                 }
             } else {
@@ -1292,19 +1369,27 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     }
 
     // =========================================================================
-    // Track A: Multi-threaded AVX2 CPU Pipeline
+    // Track A: Multi-threaded AVX2 CPU Pipeline (Cooperative Abort & Memory-Bounded)
     // =========================================================================
+    ScopedCpuRenderLock cpuGate(g_cpuRenderLock);
+    if (is_ofx_aborted(effect)) {
+        release_all_clips();
+        return kOfxStatOK;
+    }
+
     std::vector<librenoise::VideoFrame32F> frameWindow;
     frameWindow.reserve(srcInfos.size());
-    librenoise::ImagePlane32F refAlpha(width, height);
     size_t refIdx = srcInfos.size() / 2;
 
     for (size_t i = 0; i < srcInfos.size(); ++i) {
+        if (is_ofx_aborted(effect)) {
+            release_all_clips();
+            return kOfxStatOK;
+        }
         const OfxImgInfo& si = srcInfos[i];
         librenoise::VideoFrame32F f(width, height);
-        bool saveAlpha = (i == refIdx);
 
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpuThreads)
         for (int y = 0; y < height; ++y) {
             int wy = outInfo.bounds[1] + y;
             for (int x = 0; x < width; ++x) {
@@ -1313,10 +1398,24 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 f.channels[0].at(x, y) = rgba[0];
                 f.channels[1].at(x, y) = rgba[1];
                 f.channels[2].at(x, y) = rgba[2];
-                if (saveAlpha) refAlpha.at(x, y) = rgba[3];
             }
         }
         frameWindow.push_back(std::move(f));
+    }
+
+    librenoise::NoiseProfile activeProfile;
+    if (calibrated != 0.0) {
+        activeProfile.profile_name = "CalibratedSensor";
+        activeProfile.nlf_per_channel[0] = {static_cast<float>(nlfSlopeY), static_cast<float>(nlfInterceptY)};
+        activeProfile.nlf_per_channel[1] = {static_cast<float>(nlfSlopeCb), static_cast<float>(nlfInterceptCb)};
+        activeProfile.nlf_per_channel[2] = {static_cast<float>(nlfSlopeCr), static_cast<float>(nlfInterceptCr)};
+    } else {
+        activeProfile = librenoise::NoiseProfiler::auto_estimate(frameWindow[refIdx]);
+    }
+
+    if (is_ofx_aborted(effect)) {
+        release_all_clips();
+        return kOfxStatOK;
     }
 
     librenoise::VideoDenoiser::Config config;
@@ -1330,6 +1429,9 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     config.filter_params.spatial_weight = static_cast<float>(spatStrength);
     config.filter_params.chroma_scale_cr = static_cast<float>(chromaCr);
     config.filter_params.chroma_scale_cb = static_cast<float>(chromaCb);
+    config.filter_params.abort_fn = &ofx_abort_trampoline;
+    config.filter_params.abort_user_data = effect;
+    config.filter_params.max_threads = cpuThreads;
 
     config.filter_params.band_weights[0] = static_cast<float>(bandVL);
     config.filter_params.band_weights[1] = static_cast<float>(bandL);
@@ -1349,13 +1451,20 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     librenoise::VideoDenoiser denoiser(config);
     librenoise::VideoFrame32F denoised = denoiser.process_window(frameWindow, &activeProfile);
 
+    if (is_ofx_aborted(effect)) {
+        release_all_clips();
+        return kOfxStatOK;
+    }
+
     const auto& refFrame = frameWindow[refIdx];
+    const OfxImgInfo& refSrcInfo = srcInfos[refIdx];
     float mixFactor = static_cast<float>(mixWithOriginal);
     const int outCh = outInfo.channels;
 
     if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpuThreads)
         for (int y = 0; y < height; ++y) {
+            const int wy = outInfo.bounds[1] + y;
             auto* dstRow = reinterpret_cast<float*>(
                 reinterpret_cast<uint8_t*>(outInfo.data) +
                 static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
@@ -1383,15 +1492,16 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     dstRow[x * outCh + 0] = std::max(0.0f, r);
                     dstRow[x * outCh + 1] = std::max(0.0f, g);
                     dstRow[x * outCh + 2] = std::max(0.0f, b);
-                    if (outCh >= 4) dstRow[x * outCh + 3] = refAlpha.at(x, y);
+                    if (outCh >= 4) dstRow[x * outCh + 3] = sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy);
                 } else if (outCh == 1) {
                     dstRow[x] = std::max(0.0f, r);
                 }
             }
         }
     } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthShort) == 0) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpuThreads)
         for (int y = 0; y < height; ++y) {
+            const int wy = outInfo.bounds[1] + y;
             auto* dstRow = reinterpret_cast<uint16_t*>(
                 reinterpret_cast<uint8_t*>(outInfo.data) +
                 static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
@@ -1400,7 +1510,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     denoised.channels[0].at(x, y),
                     denoised.channels[1].at(x, y),
                     denoised.channels[2].at(x, y),
-                    refAlpha.at(x, y)
+                    (outCh >= 4) ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f
                 };
                 float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
                 for (int c = 0; c < 3; ++c) {
@@ -1413,8 +1523,9 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
             }
         }
     } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthByte) == 0) {
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) num_threads(cpuThreads)
         for (int y = 0; y < height; ++y) {
+            const int wy = outInfo.bounds[1] + y;
             auto* dstRow = reinterpret_cast<uint8_t*>(outInfo.data) +
                            static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes);
             for (int x = 0; x < width; ++x) {
@@ -1422,7 +1533,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     denoised.channels[0].at(x, y),
                     denoised.channels[1].at(x, y),
                     denoised.channels[2].at(x, y),
-                    refAlpha.at(x, y)
+                    (outCh >= 4) ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f
                 };
                 float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
                 for (int c = 0; c < 3; ++c) {
@@ -1436,8 +1547,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         }
     }
 
-    for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
-    g_effectSuite->clipReleaseImage(outImage);
+    release_all_clips();
 
     return kOfxStatOK;
 }

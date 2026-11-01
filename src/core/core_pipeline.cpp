@@ -33,7 +33,16 @@ VideoFrame32F VideoDenoiser::process_window(
     std::vector<MotionField> motion_fields(total_frames);
     const auto& ref_luma = ref_frame.channels[0];
 
+    float max_band_scale = 1.0f;
+    for (size_t b = 0; b < 5; ++b) {
+        max_band_scale = std::max(max_band_scale,
+            active_profile.psd.octave_weights[0][b] * config_.filter_params.band_weights[b]);
+    }
+
     for (size_t i = 0; i < total_frames; ++i) {
+        if (config_.filter_params.is_aborted()) {
+            return ref_frame;
+        }
         if (i == ref_idx) {
             motion_fields[i] = MotionField(); // Identity
             continue;
@@ -52,6 +61,8 @@ VideoFrame32F VideoDenoiser::process_window(
 
         auto match_params = config_.match_params;
         match_params.early_exit = config_.filter_params.early_exit_motion;
+        match_params.max_threads = config_.filter_params.max_threads;
+        match_params.trust_sigma_multiplier *= max_band_scale;
 
         motion_fields[i] = MotionEstimator::estimate(
             ref_luma,
@@ -60,6 +71,10 @@ VideoFrame32F VideoDenoiser::process_window(
             drift_ratio,
             match_params
         );
+    }
+
+    if (config_.filter_params.is_aborted()) {
+        return ref_frame;
     }
 
     // Stage 3: Core Filtering via Selected Engine Dispatcher
@@ -72,6 +87,10 @@ VideoFrame32F VideoDenoiser::process_window(
         config_.filter_params,
         denoised_frame
     );
+
+    if (config_.filter_params.is_aborted()) {
+        return ref_frame;
+    }
 
     // Stage 4: Detail Polish & Calibrated Grain Re-injection
     for (size_t c = 0; c < denoised_frame.channel_count(); ++c) {

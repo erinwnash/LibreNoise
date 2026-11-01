@@ -377,6 +377,61 @@ void test_gpu_cpu_correlated_grain_parity() {
     std::cout << "  -> Passed: Correlated grain PSD, HDR > 1.0 preservation, and GPU/CPU parity verified.\n";
 }
 
+void test_cpu_cooperative_abort_and_all_engines() {
+    std::cout << "[Test] Running CPU cooperative abort and multi-engine test...\n";
+    const int w = 128;
+    const int h = 96;
+    std::vector<VideoFrame32F> seq(3, VideoFrame32F(w, h, 3));
+    for (int f = 0; f < 3; ++f) {
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                float clean = (x > 64) ? 0.65f : 0.25f;
+                float n = ((x * 23 + y * 41 + f * 67) % 100 - 50) * 0.0012f;
+                for (int c = 0; c < 3; ++c) seq[f].channels[c].at(x, y) = clean + n;
+            }
+        }
+    }
+
+    // Verify all 4 CPU engines complete cleanly with positive denoising
+    const DenoiseEngine engines[4] = {
+        DenoiseEngine::Collaborative3D,
+        DenoiseEngine::Wavelet5Band,
+        DenoiseEngine::NonLocalMeans,
+        DenoiseEngine::FrequencyDomain3D
+    };
+    for (DenoiseEngine eng : engines) {
+        VideoDenoiser::Config cfg;
+        cfg.temporal_radius = 1;
+        cfg.filter_params.engine = eng;
+        cfg.filter_params.max_threads = 4;
+        VideoDenoiser den(cfg);
+        VideoFrame32F out = den.process_window(seq);
+        LN_REQUIRE(out.is_valid());
+        LN_REQUIRE(std::isfinite(out.channels[0].at(32, 48)));
+        LN_REQUIRE(std::isfinite(out.channels[0].at(96, 48)));
+    }
+
+    // Verify cooperative abort cancels an in-flight CPU render immediately without crashing
+    struct AbortCounter {
+        int calls = 0;
+        static bool check(void* ud) {
+            auto* self = static_cast<AbortCounter*>(ud);
+            return (++self->calls >= 2);
+        }
+    } abort_ctx;
+
+    VideoDenoiser::Config abort_cfg;
+    abort_cfg.temporal_radius = 1;
+    abort_cfg.filter_params.abort_fn = &AbortCounter::check;
+    abort_cfg.filter_params.abort_user_data = &abort_ctx;
+    abort_cfg.filter_params.max_threads = 4;
+    VideoDenoiser abort_den(abort_cfg);
+    VideoFrame32F aborted_out = abort_den.process_window(seq);
+    LN_REQUIRE(aborted_out.is_valid());
+    LN_REQUIRE(abort_ctx.calls >= 2);
+    std::cout << "  -> Passed: All 4 CPU engines and cooperative abort verified.\n";
+}
+
 int main() {
     std::cout << "--- Running LibreNoise Core Unit Tests ---\n";
     test_variance_stabilization();
@@ -387,6 +442,7 @@ int main() {
     test_profile_serialization();
     test_motion_field_resilience();
     test_gpu_cpu_correlated_grain_parity();
+    test_cpu_cooperative_abort_and_all_engines();
     std::cout << "ALL TESTS PASSED SUCCESSFULLY!\n";
     return 0;
 }

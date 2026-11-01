@@ -61,6 +61,15 @@ struct FilterParams {
     int32_t dft_block_size = 16;
     int32_t dft_overlap = 8;
     float dft_threshold_factor = 2.5f;
+
+    // Host Cooperative Abort & Threading Governance
+    bool (*abort_fn)(void* user_data) = nullptr;
+    void* abort_user_data = nullptr;
+    int32_t max_threads = 0; // 0 = polite hardware auto-cap
+
+    inline bool is_aborted() const noexcept {
+        return abort_fn != nullptr && abort_fn(abort_user_data);
+    }
 };
 
 /**

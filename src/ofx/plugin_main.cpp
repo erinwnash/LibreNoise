@@ -25,12 +25,20 @@ OfxParameterSuiteV1* g_paramSuite = nullptr;
 OfxImageEffectSuiteV1* g_effectSuite = nullptr;
 
 // Parameter Names
+constexpr const char* kParamDenoiseEngine    = "denoiseEngine";
 constexpr const char* kParamTemporalRadius   = "temporalRadius";
 constexpr const char* kParamTemporalStrength = "temporalStrength";
 constexpr const char* kParamSpatialStrength  = "spatialStrength";
 constexpr const char* kParamDetailRecovery   = "detailRecovery";
 constexpr const char* kParamGrainAmount      = "grainAmount";
 constexpr const char* kParamPreviewMode      = "previewMode";
+
+// 5-Band Strengths
+constexpr const char* kParamBandVeryLow      = "bandVeryLow";
+constexpr const char* kParamBandLow          = "bandLow";
+constexpr const char* kParamBandMid          = "bandMid";
+constexpr const char* kParamBandHigh         = "bandHigh";
+constexpr const char* kParamBandVeryHigh     = "bandVeryHigh";
 
 // Action: Load
 OfxStatus action_load() {
@@ -91,8 +99,17 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     OfxParamSetHandle paramSet = nullptr;
     g_effectSuite->getParamSet(effect, &paramSet);
 
-    // 1. Temporal Radius (Integer 0 to 4)
+    // 0. Processing Engine Choice
     OfxPropertySetHandle pProps = nullptr;
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamDenoiseEngine, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Denoise Engine");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "3D Collaborative Transform (Highest Fidelity)");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "5-Band Wavelet Decomposition (Fastest / Real-time)");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 2, "Non-Local Means (Best for Fabrics & Pores)");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 3, "Frequency-Domain 3D (Best for Sensor Banding)");
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 0);
+
+    // 1. Temporal Radius (Integer 0 to 4)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeInteger, kParamTemporalRadius, &pProps);
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Radius");
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 2);
@@ -112,6 +129,37 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
+
+    // 5-Band Fine Controls
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryLow, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very Low");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandLow, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Low");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandMid, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Mid");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandHigh, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: High");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryHigh, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very High");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     // 4. Detail Recovery
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamDetailRecovery, &pProps);
@@ -181,6 +229,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     OfxParamSetHandle paramSet = nullptr;
     g_effectSuite->getParamSet(effect, &paramSet);
 
+    int engineChoice = 0;
     int radius = 2;
     double tempStrength = 1.0;
     double spatStrength = 1.0;
@@ -188,10 +237,18 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     double grainAmt = 0.0;
     int previewMode = 0;
 
+    double bandVL = 1.0, bandL = 1.0, bandM = 1.0, bandH = 1.0, bandVH = 1.0;
+
     OfxParamHandle p = nullptr;
+    if (g_paramSuite->paramGetHandle(paramSet, kParamDenoiseEngine, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &engineChoice);
     if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalRadius, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &radius);
     if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tempStrength);
     if (g_paramSuite->paramGetHandle(paramSet, kParamSpatialStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &spatStrength);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandVL);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamBandLow, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandL);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamBandMid, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandM);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamBandHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandH);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamBandVeryHigh, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &bandVH);
     if (g_paramSuite->paramGetHandle(paramSet, kParamDetailRecovery, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &detailRec);
     if (g_paramSuite->paramGetHandle(paramSet, kParamGrainAmount, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &grainAmt);
     if (g_paramSuite->paramGetHandle(paramSet, kParamPreviewMode, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &previewMode);
@@ -276,6 +333,12 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     // Configure Denoiser
     librenoise::VideoDenoiser::Config config;
     config.temporal_radius = radius;
+    config.filter_params.engine = static_cast<librenoise::DenoiseEngine>(std::clamp(engineChoice, 0, 3));
+    config.filter_params.band_weights[0] = static_cast<float>(bandVL);
+    config.filter_params.band_weights[1] = static_cast<float>(bandL);
+    config.filter_params.band_weights[2] = static_cast<float>(bandM);
+    config.filter_params.band_weights[3] = static_cast<float>(bandH);
+    config.filter_params.band_weights[4] = static_cast<float>(bandVH);
     config.filter_params.patch_size = 8;
     config.filter_params.step_size = 3;
     config.filter_params.temporal_weight = static_cast<float>(tempStrength);

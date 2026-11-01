@@ -56,10 +56,16 @@ VideoFrame32F VideoDenoiser::process_window(
         );
     }
 
-    // Stage 3: Core 3D Collaborative Spatiotemporal Shrinkage
-    CollaborativePatchFilter3D filter(config_.filter_params);
+    // Stage 3: Core Filtering via Selected Engine Dispatcher
     VideoFrame32F denoised_frame;
-    filter.process(temporal_window, ref_idx, motion_fields, active_profile, denoised_frame);
+    FilterDispatcher::process(
+        temporal_window,
+        ref_idx,
+        motion_fields,
+        active_profile,
+        config_.filter_params,
+        denoised_frame
+    );
 
     // Stage 4: Detail Polish & Calibrated Grain Re-injection
     for (size_t c = 0; c < denoised_frame.channel_count(); ++c) {

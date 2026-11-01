@@ -5,6 +5,7 @@
 #include <cmath>
 #include <chrono>
 #include <iomanip>
+#include <string>
 
 namespace {
 
@@ -29,17 +30,14 @@ SyntheticTestPattern create_synthetic_clip(int32_t width, int32_t height, float 
     for (size_t c = 0; c < 3; ++c) {
         for (int32_t y = 0; y < height; ++y) {
             for (int32_t x = 0; x < width; ++x) {
-                // Zone plate / edge pattern for testing detail and flat regions
                 float cx = static_cast<float>(x - width / 2);
                 float cy = static_cast<float>(y - height / 2);
                 float dist = std::sqrt(cx * cx + cy * cy);
                 float val = 0.5f + 0.35f * std::sin(dist * dist * 0.002f);
-                if (x < width / 4) val = 0.2f; // Flat dark zone
-                if (x > 3 * width / 4) val = 0.8f; // Flat bright zone
+                if (x < width / 4) val = 0.2f;
+                if (x > 3 * width / 4) val = 0.8f;
 
                 test.clean.channels[c].at(x, y) = val;
-
-                // Calibrated heteroscedastic noise: Var(I) = a*I + b
                 float sigma = test.nlf.sigma_at(val);
                 float noisy_val = std::clamp(val + norm(rng) * sigma, 0.0f, 1.0f);
                 test.noisy.channels[c].at(x, y) = noisy_val;
@@ -78,20 +76,28 @@ double compute_residual_energy(const ImagePlane32F& raw, const ImagePlane32F& de
     return count > 0 ? (energy / count) : 0.0;
 }
 
+struct EngineBenchmarkResult {
+    std::string name;
+    double duration_ms;
+    double denoised_psnr;
+    double psnr_gain;
+    double res_energy;
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
-    std::cout << "=========================================================\n";
-    std::cout << " LibreNoise CLI Test & Benchmark Harness v" << LIBRENOISE_VERSION_STRING << "\n";
-    std::cout << "=========================================================\n\n";
+    std::cout << "====================================================================\n";
+    std::cout << " LibreNoise Multi-Engine Comparative Benchmark v" << LIBRENOISE_VERSION_STRING << "\n";
+    std::cout << "====================================================================\n\n";
 
     const int32_t test_w = 320;
     const int32_t test_h = 240;
     const size_t num_frames = 5;
 
-    std::cout << "[*] Synthesizing " << num_frames << " frames (" << test_w << "x" << test_h << ") with calibrated Poisson-Gaussian noise...\n";
+    std::cout << "[*] Synthesizing 5 frames (" << test_w << "x" << test_h << ") with calibrated Poisson-Gaussian noise...\n";
     std::vector<VideoFrame32F> noisy_sequence;
     SyntheticTestPattern ground_truth = create_synthetic_clip(test_w, test_h, 0.0015f, 0.0001f, 1000);
 
@@ -101,46 +107,69 @@ int main(int argc, char* argv[]) {
     }
 
     double raw_psnr = compute_psnr(ground_truth.clean.channels[0], noisy_sequence[num_frames / 2].channels[0]);
-    std::cout << "[-] Raw Noisy Reference Frame PSNR: " << std::fixed << std::setprecision(2) << raw_psnr << " dB\n";
+    std::cout << "[-] Raw Noisy Reference Frame PSNR: " << std::fixed << std::setprecision(2) << raw_psnr << " dB\n\n";
 
-    // Known ground truth noise profile
     NoiseProfile profile;
     profile.profile_name = "CalibratedTestSensor";
-    for (size_t c = 0; c < 3; ++c) {
-        profile.nlf_per_channel[c] = ground_truth.nlf;
+    for (size_t c = 0; c < 3; ++c) profile.nlf_per_channel[c] = ground_truth.nlf;
+
+    struct EngineCandidate {
+        DenoiseEngine engine;
+        std::string label;
+    };
+
+    std::vector<EngineCandidate> candidates = {
+        {DenoiseEngine::Collaborative3D, "3D Collaborative Transform (BM3D)"},
+        {DenoiseEngine::Wavelet5Band, "5-Band Wavelet Decomposition"},
+        {DenoiseEngine::NonLocalMeans, "Non-Local Means (NLM)"},
+        {DenoiseEngine::FrequencyDomain3D, "3D Frequency-Domain (DFTTest)"}
+    };
+
+    std::vector<EngineBenchmarkResult> results;
+
+    for (const auto& cand : candidates) {
+        std::cout << "[*] Benchmarking Engine: " << cand.label << " ...\n";
+
+        VideoDenoiser::Config config;
+        config.temporal_radius = 2;
+        config.filter_params.engine = cand.engine;
+        config.filter_params.patch_size = 8;
+        config.filter_params.step_size = 3;
+        config.detail_params.detail_recovery = 0.05f;
+        config.detail_params.grain_amount = 0.0f;
+
+        VideoDenoiser denoiser(config);
+
+        auto start = std::chrono::high_resolution_clock::now();
+        VideoFrame32F denoised = denoiser.process_window(noisy_sequence, &profile);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double psnr = compute_psnr(ground_truth.clean.channels[0], denoised.channels[0]);
+        double gain = psnr - raw_psnr;
+        double res = compute_residual_energy(noisy_sequence[num_frames / 2].channels[0], denoised.channels[0]);
+
+        results.push_back({cand.label, ms, psnr, gain, res});
     }
 
-    // Configure LibreNoise Pipeline
-    VideoDenoiser::Config config;
-    config.temporal_radius = 2;
-    config.filter_params.patch_size = 8;
-    config.filter_params.step_size = 3;
-    config.filter_params.hard_thresh_lambda = 2.8f;
-    config.detail_params.detail_recovery = 0.05f;
-    config.detail_params.grain_amount = 0.0f;
+    std::cout << "\n========================================================================================\n";
+    std::cout << "                       CANDIDATE ENGINE COMPARISON MATRIX\n";
+    std::cout << "========================================================================================\n";
+    std::cout << std::left << std::setw(38) << "Engine Candidate"
+              << std::setw(14) << "Time (ms)"
+              << std::setw(16) << "PSNR (dB)"
+              << std::setw(16) << "Gain (dB)"
+              << std::setw(14) << "Residual E." << "\n";
+    std::cout << "----------------------------------------------------------------------------------------\n";
 
-    VideoDenoiser denoiser(config);
+    for (const auto& r : results) {
+        std::cout << std::left << std::setw(38) << r.name
+                  << std::setw(14) << std::fixed << std::setprecision(1) << r.duration_ms
+                  << std::setw(16) << std::fixed << std::setprecision(2) << r.denoised_psnr
+                  << "+" << std::setw(15) << std::fixed << std::setprecision(2) << r.psnr_gain
+                  << std::scientific << std::setprecision(2) << r.res_energy << "\n";
+    }
+    std::cout << "========================================================================================\n\n";
 
-    std::cout << "[*] Executing 5-Stage LibreNoise Spatiotemporal Filter...\n";
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    VideoFrame32F denoised = denoiser.process_window(noisy_sequence, &profile);
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    double denoised_psnr = compute_psnr(ground_truth.clean.channels[0], denoised.channels[0]);
-    double psnr_gain = denoised_psnr - raw_psnr;
-    double res_energy = compute_residual_energy(noisy_sequence[num_frames / 2].channels[0], denoised.channels[0]);
-
-    std::cout << "\n================= BENCHMARK RESULTS =================\n";
-    std::cout << " Processing Time    : " << std::fixed << std::setprecision(1) << duration_ms << " ms\n";
-    std::cout << " Initial PSNR       : " << std::fixed << std::setprecision(2) << raw_psnr << " dB\n";
-    std::cout << " Denoised PSNR      : " << std::fixed << std::setprecision(2) << denoised_psnr << " dB\n";
-    std::cout << " PSNR Improvement   : +" << std::fixed << std::setprecision(2) << psnr_gain << " dB\n";
-    std::cout << " Residual Energy    : " << std::scientific << res_energy << "\n";
-    std::cout << " Gate 1 Status      : " << (psnr_gain >= 2.5 ? "PASSED [OK]" : "FAILED") << "\n";
-    std::cout << "=====================================================\n\n";
-
-    return (psnr_gain >= 2.5) ? 0 : 1;
+    return (results[0].psnr_gain >= 2.5) ? 0 : 1;
 }

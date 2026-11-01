@@ -27,7 +27,9 @@ if(LIBRENOISE_HAS_CUDA)
             -ccbin "${CMAKE_CXX_COMPILER}"
             -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
             -I${CUDAToolkit_INCLUDE_DIRS}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/gpu/denoise_cuda.cu
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/denoise_cuda.cu
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include/librenoise/gpu_denoiser.hpp
         COMMENT "Compiling CUDA GPU kernels (sm_86 Ampere)"
     )
     list(APPEND CORE_SOURCES ${CUDA_OBJ})

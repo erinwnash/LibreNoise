@@ -115,6 +115,74 @@ OfxStatus action_load() {
     return kOfxStatOK;
 }
 
+// Helper struct and pixel conversion utilities for arbitrary OpenFX host image layouts
+struct OfxImgInfo {
+    void* data = nullptr;
+    int rowBytes = 0;
+    int bounds[4] = {0, 0, 0, 0};
+    char* bitDepth = nullptr;
+    char* components = nullptr;
+    int channels = 4;
+
+    int width() const { return bounds[2] - bounds[0]; }
+    int height() const { return bounds[3] - bounds[1]; }
+    bool valid() const { return data != nullptr && width() > 0 && height() > 0 && rowBytes != 0; }
+};
+
+OfxImgInfo query_ofx_image(OfxPropertySetHandle img) {
+    OfxImgInfo info;
+    if (!img || !g_propSuite) return info;
+    g_propSuite->propGetPointer(img, kOfxImagePropData, 0, &info.data);
+    g_propSuite->propGetInt(img, kOfxImagePropRowBytes, 0, &info.rowBytes);
+    g_propSuite->propGetIntN(img, kOfxImagePropBounds, 4, info.bounds);
+    g_propSuite->propGetString(img, kOfxImageEffectPropPixelDepth, 0, &info.bitDepth);
+    g_propSuite->propGetString(img, kOfxImageEffectPropComponents, 0, &info.components);
+    if (info.components) {
+        if (std::strcmp(info.components, kOfxImageComponentRGB) == 0) info.channels = 3;
+        else if (std::strcmp(info.components, kOfxImageComponentAlpha) == 0) info.channels = 1;
+        else info.channels = 4;
+    }
+    return info;
+}
+
+inline void sample_ofx_pixel_rgba(const OfxImgInfo& info, int world_x, int world_y, float out_rgba[4]) {
+    int sx = std::clamp(world_x, info.bounds[0], info.bounds[2] - 1) - info.bounds[0];
+    int sy = std::clamp(world_y, info.bounds[1], info.bounds[3] - 1) - info.bounds[1];
+    const auto* row_ptr = reinterpret_cast<const uint8_t*>(info.data) +
+                          static_cast<ptrdiff_t>(sy) * static_cast<ptrdiff_t>(info.rowBytes);
+    const int ch = info.channels;
+
+    out_rgba[0] = 0.0f; out_rgba[1] = 0.0f; out_rgba[2] = 0.0f; out_rgba[3] = 1.0f;
+
+    if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthFloat) == 0) {
+        const auto* p = reinterpret_cast<const float*>(row_ptr) + sx * ch;
+        if (ch >= 3) {
+            out_rgba[0] = p[0]; out_rgba[1] = p[1]; out_rgba[2] = p[2];
+            out_rgba[3] = (ch >= 4) ? p[3] : 1.0f;
+        } else if (ch == 1) {
+            out_rgba[0] = out_rgba[1] = out_rgba[2] = p[0];
+        }
+    } else if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthShort) == 0) {
+        const auto* p = reinterpret_cast<const uint16_t*>(row_ptr) + sx * ch;
+        constexpr float inv16 = 1.0f / 65535.0f;
+        if (ch >= 3) {
+            out_rgba[0] = p[0] * inv16; out_rgba[1] = p[1] * inv16; out_rgba[2] = p[2] * inv16;
+            out_rgba[3] = (ch >= 4) ? (p[3] * inv16) : 1.0f;
+        } else if (ch == 1) {
+            out_rgba[0] = out_rgba[1] = out_rgba[2] = p[0] * inv16;
+        }
+    } else if (info.bitDepth && std::strcmp(info.bitDepth, kOfxBitDepthByte) == 0) {
+        const auto* p = row_ptr + sx * ch;
+        constexpr float inv8 = 1.0f / 255.0f;
+        if (ch >= 3) {
+            out_rgba[0] = p[0] * inv8; out_rgba[1] = p[1] * inv8; out_rgba[2] = p[2] * inv8;
+            out_rgba[3] = (ch >= 4) ? (p[3] * inv8) : 1.0f;
+        } else if (ch == 1) {
+            out_rgba[0] = out_rgba[1] = out_rgba[2] = p[0] * inv8;
+        }
+    }
+}
+
 // Action: Describe
 OfxStatus action_describe(OfxImageEffectHandle effect) {
     OfxPropertySetHandle effectProps = nullptr;
@@ -136,13 +204,18 @@ OfxStatus action_describe(OfxImageEffectHandle effect) {
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthShort);
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedPixelDepths, 2, kOfxBitDepthByte);
 
+    // Full-frame untiled spatial/motion analysis & single render call per frame (OpenMP/CUDA internal threading)
+    g_propSuite->propSetInt(effectProps, kOfxImageEffectPropSupportsTiles, 0, 0);
+    g_propSuite->propSetInt(effectProps, kOfxImageEffectPluginPropHostFrameThreading, 0, 0);
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPluginRenderThreadSafety, 0, kOfxImageEffectRenderInstanceSafe);
+
     // Request temporal frame access
     g_propSuite->propSetInt(effectProps, kOfxImageEffectPropTemporalClipAccess, 0, 1);
 
-    // OpenFX 1.5 GPU Render Support (Track B)
+    // OpenFX 1.5 GPU Render Support (Track B - CUDA native)
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropCudaRenderSupported, 0, "true");
     g_propSuite->propSetString(effectProps, kOfxImageEffectPropCudaStreamSupported, 0, "true");
-    g_propSuite->propSetString(effectProps, kOfxImageEffectPropOpenCLRenderSupported, 0, "true");
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropOpenCLRenderSupported, 0, "false");
 
     // Viewer Overlay Interact Entry (Track B / Interactive Parity)
     g_propSuite->propSetPointer(effectProps, kOfxImageEffectPluginPropOverlayInteractV1, 0,
@@ -154,17 +227,19 @@ OfxStatus action_describe(OfxImageEffectHandle effect) {
 // Action: DescribeInContext
 OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
     (void)inArgs;
-    // Clips: Define Output and Source
+    // Clips: Define Output and Source (untiled full-frame buffers)
     OfxPropertySetHandle outputProps = nullptr;
     g_effectSuite->clipDefine(effect, kOfxImageEffectOutputClipName, &outputProps);
     g_propSuite->propSetString(outputProps, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
     g_propSuite->propSetString(outputProps, kOfxImageEffectPropSupportedComponents, 1, kOfxImageComponentRGB);
+    g_propSuite->propSetInt(outputProps, kOfxImageEffectPropSupportsTiles, 0, 0);
 
     OfxPropertySetHandle sourceProps = nullptr;
     g_effectSuite->clipDefine(effect, kOfxImageEffectSimpleSourceClipName, &sourceProps);
     g_propSuite->propSetString(sourceProps, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
     g_propSuite->propSetString(sourceProps, kOfxImageEffectPropSupportedComponents, 1, kOfxImageComponentRGB);
     g_propSuite->propSetInt(sourceProps, kOfxImageEffectPropTemporalClipAccess, 0, 1);
+    g_propSuite->propSetInt(sourceProps, kOfxImageEffectPropSupportsTiles, 0, 0);
 
     // Overlay interact descriptor hook for context
     OfxPropertySetHandle effectProps = nullptr;
@@ -536,8 +611,13 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
     g_effectSuite->getParamSet(effect, &paramSet);
     if (!paramSet) return kOfxStatReplyDefault;
 
-    // Helper lambda to fetch the current source frame
-    auto fetch_current_frame = [&]() -> std::optional<librenoise::VideoFrame32F> {
+    // Helper lambda to fetch the current source frame along with its pixel origin
+    struct FetchedFrame {
+        librenoise::VideoFrame32F frame;
+        int origin_x = 0;
+        int origin_y = 0;
+    };
+    auto fetch_current_frame = [&]() -> std::optional<FetchedFrame> {
         OfxImageClipHandle srcClip = nullptr;
         if (g_effectSuite->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &srcClip, nullptr) != kOfxStatOK || !srcClip) {
             return std::nullopt;
@@ -547,60 +627,41 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
             return std::nullopt;
         }
 
-        void* srcData = nullptr;
-        g_propSuite->propGetPointer(srcImg, kOfxImagePropData, 0, &srcData);
-        int srcBounds[4] = {0, 0, 0, 0};
-        g_propSuite->propGetIntN(srcImg, kOfxImagePropBounds, 4, srcBounds);
-        int srcRowBytes = 0;
-        g_propSuite->propGetInt(srcImg, kOfxImagePropRowBytes, 0, &srcRowBytes);
-        char* bitDepth = nullptr;
-        g_propSuite->propGetString(srcImg, kOfxImageEffectPropPixelDepth, 0, &bitDepth);
-
-        int width = srcBounds[2] - srcBounds[0];
-        int height = srcBounds[3] - srcBounds[1];
-        if (width <= 0 || height <= 0 || !srcData) {
+        OfxImgInfo info = query_ofx_image(srcImg);
+        if (!info.valid()) {
             g_effectSuite->clipReleaseImage(srcImg);
             return std::nullopt;
         }
 
-        librenoise::VideoFrame32F frame(width, height);
-        if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
-            const auto* s = reinterpret_cast<const float*>(srcData);
-            int stride = srcRowBytes / sizeof(float);
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    frame.channels[0].at(x, y) = s[y * stride + x * 4 + 0];
-                    frame.channels[1].at(x, y) = s[y * stride + x * 4 + 1];
-                    frame.channels[2].at(x, y) = s[y * stride + x * 4 + 2];
-                }
-            }
-        } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
-            const auto* s = reinterpret_cast<const uint8_t*>(srcData);
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    frame.channels[0].at(x, y) = s[y * srcRowBytes + x * 4 + 0] / 255.0f;
-                    frame.channels[1].at(x, y) = s[y * srcRowBytes + x * 4 + 1] / 255.0f;
-                    frame.channels[2].at(x, y) = s[y * srcRowBytes + x * 4 + 2] / 255.0f;
-                }
+        int width = info.width();
+        int height = info.height();
+        FetchedFrame result{librenoise::VideoFrame32F(width, height), info.bounds[0], info.bounds[1]};
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float rgba[4];
+                sample_ofx_pixel_rgba(info, info.bounds[0] + x, info.bounds[1] + y, rgba);
+                result.frame.channels[0].at(x, y) = rgba[0];
+                result.frame.channels[1].at(x, y) = rgba[1];
+                result.frame.channels[2].at(x, y) = rgba[2];
             }
         }
         g_effectSuite->clipReleaseImage(srcImg);
-        return frame;
+        return result;
     };
 
     // Auto Profile or Auto Detect Area
     if (std::strcmp(paramName, kParamAutoProfile) == 0 || std::strcmp(paramName, kParamAutoDetectArea) == 0) {
         auto optFrame = fetch_current_frame();
         if (optFrame.has_value()) {
-            const auto& frame = *optFrame;
+            const auto& frame = optFrame->frame;
             auto roi = librenoise::NoiseRoiAnalyzer::find_optimal_roi(frame);
 
             OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
-                g_paramSuite->paramSetValue(boxP1, static_cast<double>(roi.x), static_cast<double>(roi.y));
+                g_paramSuite->paramSetValue(boxP1, static_cast<double>(optFrame->origin_x + roi.x), static_cast<double>(optFrame->origin_y + roi.y));
             }
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
-                g_paramSuite->paramSetValue(boxP2, static_cast<double>(roi.x + roi.width), static_cast<double>(roi.y + roi.height));
+                g_paramSuite->paramSetValue(boxP2, static_cast<double>(optFrame->origin_x + roi.x + roi.width), static_cast<double>(optFrame->origin_y + roi.y + roi.height));
             }
 
             if (std::strcmp(paramName, kParamAutoProfile) == 0) {
@@ -650,7 +711,7 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
     if (std::strcmp(paramName, kParamBuildProfile) == 0) {
         auto optFrame = fetch_current_frame();
         if (optFrame.has_value()) {
-            const auto& frame = *optFrame;
+            const auto& frame = optFrame->frame;
             double coords[4] = {0, 0, 128, 128};
             OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
@@ -659,11 +720,15 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
                 g_paramSuite->paramGetValue(boxP2, &coords[2], &coords[3]);
             }
-            int32_t x1 = static_cast<int32_t>(std::round(std::min(coords[0], coords[2])));
-            int32_t y1 = static_cast<int32_t>(std::round(std::min(coords[1], coords[3])));
-            int32_t x2 = static_cast<int32_t>(std::round(std::max(coords[0], coords[2])));
-            int32_t y2 = static_cast<int32_t>(std::round(std::max(coords[1], coords[3])));
-            librenoise::AnalysisRoi roi{x1, y1, std::max(16, x2 - x1), std::max(16, y2 - y1)};
+            int32_t x1 = static_cast<int32_t>(std::round(std::min(coords[0], coords[2]))) - optFrame->origin_x;
+            int32_t y1 = static_cast<int32_t>(std::round(std::min(coords[1], coords[3]))) - optFrame->origin_y;
+            int32_t x2 = static_cast<int32_t>(std::round(std::max(coords[0], coords[2]))) - optFrame->origin_x;
+            int32_t y2 = static_cast<int32_t>(std::round(std::max(coords[1], coords[3]))) - optFrame->origin_y;
+            x1 = std::clamp(x1, 0, std::max(0, frame.width - 16));
+            y1 = std::clamp(y1, 0, std::max(0, frame.height - 16));
+            int32_t rw = std::clamp(x2 - x1, 16, frame.width - x1);
+            int32_t rh = std::clamp(y2 - y1, 16, frame.height - y1);
+            librenoise::AnalysisRoi roi{x1, y1, rw, rh};
 
             auto result = librenoise::NoiseRoiAnalyzer::analyze_roi(frame, roi);
 
@@ -812,6 +877,17 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
                 {1.00f, static_cast<float>(t4)}
             });
 
+            double sY = 0.00035, iY = 0.00003, sCb = 0.00030, iCb = 0.000025, sCr = 0.00030, iCr = 0.000025;
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeY, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &sY);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptY, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &iY);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCb, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &sCb);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCb, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &iCb);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCr, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &sCr);
+            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCr, &p, nullptr) == kOfxStatOK && p) g_paramSuite->paramGetValue(p, &iCr);
+            prof.nlf_y = {static_cast<float>(sY), static_cast<float>(iY)};
+            prof.nlf_cb = {static_cast<float>(sCb), static_cast<float>(iCb)};
+            prof.nlf_cr = {static_cast<float>(sCr), static_cast<float>(iCr)};
+
             librenoise::ProfileSerializer::save_to_file(pathStr, prof);
         }
         return kOfxStatOK;
@@ -854,6 +930,10 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 
     double bandVL = 1.0, bandL = 1.0, bandM = 1.0, bandH = 1.0, bandVH = 1.0;
     double tonalSh = 1.3, tonalDM = 1.15, tonalMid = 1.0, tonalLM = 0.9, tonalHi = 0.8;
+    double calibrated = 0.0;
+    double nlfSlopeY = 0.00035, nlfInterceptY = 0.00003;
+    double nlfSlopeCb = 0.00030, nlfInterceptCb = 0.000025;
+    double nlfSlopeCr = 0.00030, nlfInterceptCr = 0.000025;
 
     if (paramSet) {
         OfxParamHandle p = nullptr;
@@ -882,6 +962,15 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         if (g_paramSuite->paramGetHandle(paramSet, kParamDetailRecovery, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &detailRec);
         if (g_paramSuite->paramGetHandle(paramSet, kParamGrainAmount, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &grainAmt);
         if (g_paramSuite->paramGetHandle(paramSet, kParamPreviewMode, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &previewMode);
+
+        OfxParamHandle hp = nullptr;
+        if (g_paramSuite->paramGetHandle(paramSet, kParamCalibrated, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &calibrated);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeY);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptY);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCb);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCb);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCr);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCr);
     }
 
     // Get Output Image
@@ -893,18 +982,10 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     g_effectSuite->clipGetImage(outputClip, renderTime, nullptr, &outImage);
     if (!outImage) return kOfxStatFailed;
 
-    void* outData = nullptr;
-    g_propSuite->propGetPointer(outImage, kOfxImagePropData, 0, &outData);
-    int outRowBytes = 0;
-    g_propSuite->propGetInt(outImage, kOfxImagePropRowBytes, 0, &outRowBytes);
-    int bounds[4] = {0, 0, 0, 0};
-    g_propSuite->propGetIntN(outImage, kOfxImagePropBounds, 4, bounds);
-    char* bitDepth = nullptr;
-    g_propSuite->propGetString(outImage, kOfxImageEffectPropPixelDepth, 0, &bitDepth);
-
-    int width = bounds[2] - bounds[0];
-    int height = bounds[3] - bounds[1];
-    if (width <= 0 || height <= 0 || !outData) {
+    OfxImgInfo outInfo = query_ofx_image(outImage);
+    int width = outInfo.width();
+    int height = outInfo.height();
+    if (!outInfo.valid()) {
         g_effectSuite->clipReleaseImage(outImage);
         return kOfxStatOK;
     }
@@ -918,6 +999,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     }
 
     std::vector<OfxPropertySetHandle> sourceImages;
+    std::vector<OfxImgInfo> srcInfos;
 
     for (int t = -radius; t <= radius; ++t) {
         double frameTime = renderTime + t;
@@ -927,7 +1009,13 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
             g_effectSuite->clipGetImage(sourceClip, renderTime, nullptr, &srcImg);
         }
         if (srcImg) {
-            sourceImages.push_back(srcImg);
+            OfxImgInfo si = query_ofx_image(srcImg);
+            if (si.valid()) {
+                sourceImages.push_back(srcImg);
+                srcInfos.push_back(si);
+            } else {
+                g_effectSuite->clipReleaseImage(srcImg);
+            }
         }
     }
 
@@ -936,19 +1024,68 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         return kOfxStatOK;
     }
 
+    // Resolve Unified Noise Profile (shared identically between GPU Track B and CPU Track A)
+    librenoise::NoiseProfile activeProfile;
+    if (calibrated != 0.0) {
+        activeProfile.profile_name = "CalibratedSensor";
+        activeProfile.nlf_per_channel[0] = {static_cast<float>(nlfSlopeY), static_cast<float>(nlfInterceptY)};
+        activeProfile.nlf_per_channel[1] = {static_cast<float>(nlfSlopeCb), static_cast<float>(nlfInterceptCb)};
+        activeProfile.nlf_per_channel[2] = {static_cast<float>(nlfSlopeCr), static_cast<float>(nlfInterceptCr)};
+        // Calibrated 5-band PSD is already stored in user-editable bandVL..bandVH sliders
+    } else {
+        size_t auto_ref_idx = srcInfos.size() / 2;
+        const OfxImgInfo& refInfo = srcInfos[auto_ref_idx];
+        int rw = refInfo.width();
+        int rh = refInfo.height();
+        librenoise::VideoFrame32F refF(rw, rh);
+
+        if (cudaEnabled != 0) {
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+            size_t totalBytes = static_cast<size_t>(std::abs(refInfo.rowBytes)) * static_cast<size_t>(rh);
+            std::vector<uint8_t> h_copy(totalBytes);
+            if (cudaMemcpy(h_copy.data(), refInfo.data, totalBytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                OfxImgInfo hostRef = refInfo;
+                hostRef.data = h_copy.data();
+                hostRef.rowBytes = std::abs(refInfo.rowBytes);
+                for (int y = 0; y < rh; ++y) {
+                    for (int x = 0; x < rw; ++x) {
+                        float rgba[4];
+                        sample_ofx_pixel_rgba(hostRef, hostRef.bounds[0] + x, hostRef.bounds[1] + y, rgba);
+                        refF.channels[0].at(x, y) = rgba[0];
+                        refF.channels[1].at(x, y) = rgba[1];
+                        refF.channels[2].at(x, y) = rgba[2];
+                    }
+                }
+                activeProfile = librenoise::NoiseProfiler::auto_estimate(refF);
+            }
+#endif
+        } else {
+            for (int y = 0; y < rh; ++y) {
+                for (int x = 0; x < rw; ++x) {
+                    float rgba[4];
+                    sample_ofx_pixel_rgba(refInfo, refInfo.bounds[0] + x, refInfo.bounds[1] + y, rgba);
+                    refF.channels[0].at(x, y) = rgba[0];
+                    refF.channels[1].at(x, y) = rgba[1];
+                    refF.channels[2].at(x, y) = rgba[2];
+                }
+            }
+            activeProfile = librenoise::NoiseProfiler::auto_estimate(refF);
+        }
+    }
+
     // =========================================================================
     // Track B: GPU Acceleration Pipeline (CUDA sm_86)
     // =========================================================================
-    bool canUseCuda = (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0 &&
-                       accelMode != 2 && librenoise::is_cuda_available());
+    bool canUseCuda = (accelMode != 2 && librenoise::is_cuda_available());
 
     if (canUseCuda) {
         librenoise::CudaDenoiseParams cp;
         cp.width = width;
         cp.height = height;
-        cp.stride_floats = outRowBytes / static_cast<int32_t>(sizeof(float));
-        cp.channels = 4;
         cp.step_size = (qualityChoice == 0) ? 6 : (qualityChoice == 1) ? 4 : 3;
+        cp.engine_choice = engineChoice;
+        cp.early_exit_motion = earlyExitMotion;
+        cp.fast_chroma = fastChroma;
         cp.temporal_weight = static_cast<float>(tempStrength);
         cp.spatial_weight = static_cast<float>(spatStrength);
         cp.band_weights[0] = static_cast<float>(bandVL);
@@ -956,64 +1093,18 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         cp.band_weights[2] = static_cast<float>(bandM);
         cp.band_weights[3] = static_cast<float>(bandH);
         cp.band_weights[4] = static_cast<float>(bandVH);
-        double calibrated = 0.0;
-        double nlfSlopeY = 0.00035, nlfInterceptY = 0.00003;
-        double nlfSlopeCb = 0.00030, nlfInterceptCb = 0.000025;
-        double nlfSlopeCr = 0.00030, nlfInterceptCr = 0.000025;
-        if (paramSet) {
-            OfxParamHandle hp = nullptr;
-            if (g_paramSuite->paramGetHandle(paramSet, kParamCalibrated, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &calibrated);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeY);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptY, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptY);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCb);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCb, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCb);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfSlopeCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfSlopeCr);
-            if (g_paramSuite->paramGetHandle(paramSet, kParamNlfInterceptCr, &hp, nullptr) == kOfxStatOK && hp) g_paramSuite->paramGetValue(hp, &nlfInterceptCr);
-        }
-
-        // When uncalibrated, dynamically auto-estimate noise from the reference frame
-        if (calibrated == 0.0 && !sourceImages.empty()) {
-            size_t auto_ref_idx = sourceImages.size() / 2;
-            void* refData = nullptr;
-            g_propSuite->propGetPointer(sourceImages[auto_ref_idx], kOfxImagePropData, 0, &refData);
-            int refRowBytes = 0;
-            g_propSuite->propGetInt(sourceImages[auto_ref_idx], kOfxImagePropRowBytes, 0, &refRowBytes);
-
-            if (refData && refRowBytes > 0) {
-                librenoise::VideoFrame32F refF(width, height);
-                int floatStride = refRowBytes / static_cast<int>(sizeof(float));
-                const float* s = reinterpret_cast<const float*>(refData);
-                std::vector<float> h_ref_copy;
-                if (cudaEnabled != 0) {
-#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-                    h_ref_copy.resize(static_cast<size_t>(floatStride * height));
-                    cudaMemcpy(h_ref_copy.data(), refData, floatStride * height * sizeof(float), cudaMemcpyDeviceToHost);
-                    s = h_ref_copy.data();
-#endif
-                }
-                for (int y = 0; y < height; ++y) {
-                    for (int x = 0; x < width; ++x) {
-                        refF.channels[0].at(x, y) = s[y * floatStride + x * 4 + 0];
-                        refF.channels[1].at(x, y) = s[y * floatStride + x * 4 + 1];
-                        refF.channels[2].at(x, y) = s[y * floatStride + x * 4 + 2];
-                    }
-                }
-                auto autoProf = librenoise::NoiseProfiler::auto_estimate(refF);
-                nlfSlopeY = autoProf.nlf_per_channel[0].a;
-                nlfInterceptY = autoProf.nlf_per_channel[0].b;
-                nlfSlopeCb = autoProf.nlf_per_channel[1].a;
-                nlfInterceptCb = autoProf.nlf_per_channel[1].b;
-                nlfSlopeCr = autoProf.nlf_per_channel[2].a;
-                nlfInterceptCr = autoProf.nlf_per_channel[2].b;
+        cp.tonal_lut[0] = static_cast<float>(tonalSh);
+        cp.tonal_lut[1] = static_cast<float>(tonalDM);
+        cp.tonal_lut[2] = static_cast<float>(tonalMid);
+        cp.tonal_lut[3] = static_cast<float>(tonalLM);
+        cp.tonal_lut[4] = static_cast<float>(tonalHi);
+        for (int c = 0; c < 3; ++c) {
+            cp.nlf_a[c] = activeProfile.nlf_per_channel[c].a;
+            cp.nlf_b[c] = activeProfile.nlf_per_channel[c].b;
+            for (int b = 0; b < 5; ++b) {
+                cp.psd_weights[c][b] = activeProfile.psd.octave_weights[c][b];
             }
         }
-
-        cp.nlf_a[0] = static_cast<float>(nlfSlopeY);
-        cp.nlf_b[0] = static_cast<float>(nlfInterceptY);
-        cp.nlf_a[1] = static_cast<float>(nlfSlopeCb);
-        cp.nlf_b[1] = static_cast<float>(nlfInterceptCb);
-        cp.nlf_a[2] = static_cast<float>(nlfSlopeCr);
-        cp.nlf_b[2] = static_cast<float>(nlfInterceptCr);
         cp.detail_recovery = static_cast<float>(detailRec);
         cp.grain_amount = static_cast<float>(grainAmt);
         cp.mix_original = static_cast<float>(mixWithOriginal);
@@ -1021,79 +1112,170 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         cp.chroma_scale_cb = static_cast<float>(chromaCb);
         cp.preview_mode = previewMode;
 
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
         // Path B1: Host passed native CUDA device pointers (Zero-copy GPU render)
         if (cudaEnabled != 0) {
-            void* cudaStream = nullptr;
-            g_propSuite->propGetPointer(inArgs, kOfxImageEffectPropCudaStream, 0, &cudaStream);
-
-            std::vector<const float*> d_ptrs;
-            for (auto img : sourceImages) {
-                void* d_src = nullptr;
-                g_propSuite->propGetPointer(img, kOfxImagePropData, 0, &d_src);
-                d_ptrs.push_back(reinterpret_cast<const float*>(d_src));
+            bool directCompatible = (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0 &&
+                                     outInfo.rowBytes > 0 && outInfo.channels >= 3);
+            for (const auto& si : srcInfos) {
+                if (si.rowBytes != outInfo.rowBytes || si.channels != outInfo.channels ||
+                    si.bounds[0] != outInfo.bounds[0] || si.bounds[1] != outInfo.bounds[1] ||
+                    si.bounds[2] != outInfo.bounds[2] || si.bounds[3] != outInfo.bounds[3]) {
+                    directCompatible = false;
+                    break;
+                }
             }
 
-#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-            const float** d_frame_arr = nullptr;
-            cudaStream_t stream = reinterpret_cast<cudaStream_t>(cudaStream);
-            cudaMallocAsync(&d_frame_arr, d_ptrs.size() * sizeof(float*), stream);
-            cudaMemcpyAsync(d_frame_arr, d_ptrs.data(), d_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream);
+            if (directCompatible) {
+                cp.stride_floats = outInfo.rowBytes / static_cast<int32_t>(sizeof(float));
+                cp.channels = outInfo.channels;
 
-            int32_t ref_idx = static_cast<int32_t>(d_ptrs.size() / 2);
-            bool ok = librenoise::cuda_denoise_device(
-                d_frame_arr,
-                static_cast<int32_t>(d_ptrs.size()),
-                ref_idx,
-                reinterpret_cast<float*>(outData),
-                cp,
-                cudaStream
-            );
-            cudaFree(d_frame_arr);
+                void* cudaStream = nullptr;
+                g_propSuite->propGetPointer(inArgs, kOfxImageEffectPropCudaStream, 0, &cudaStream);
+                cudaStream_t stream = reinterpret_cast<cudaStream_t>(cudaStream);
 
-            if (ok) {
-                for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
-                g_effectSuite->clipReleaseImage(outImage);
-                return kOfxStatOK;
+                std::vector<const float*> d_ptrs;
+                d_ptrs.reserve(srcInfos.size());
+                for (const auto& si : srcInfos) {
+                    d_ptrs.push_back(reinterpret_cast<const float*>(si.data));
+                }
+
+                const float** d_frame_arr = nullptr;
+                if (cudaMalloc(&d_frame_arr, d_ptrs.size() * sizeof(float*)) == cudaSuccess) {
+                    cudaMemcpyAsync(d_frame_arr, d_ptrs.data(), d_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice, stream);
+
+                    int32_t ref_idx = static_cast<int32_t>(d_ptrs.size() / 2);
+                    bool ok = librenoise::cuda_denoise_device(
+                        d_frame_arr,
+                        static_cast<int32_t>(d_ptrs.size()),
+                        ref_idx,
+                        reinterpret_cast<float*>(outInfo.data),
+                        cp,
+                        cudaStream
+                    );
+                    cudaFree(d_frame_arr);
+
+                    if (ok) {
+                        for (auto img : sourceImages) g_effectSuite->clipReleaseImage(img);
+                        g_effectSuite->clipReleaseImage(outImage);
+                        return kOfxStatOK;
+                    }
+                }
             }
-#endif
         } else {
-            // Path B2: Host passed CPU system memory, but GPU acceleration is available
-#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-            size_t frameBytes = static_cast<size_t>(outRowBytes * height);
-            std::vector<float*> d_alloc_ptrs(sourceImages.size(), nullptr);
+            // Path B2: Host passed CPU system memory (Float/Short/Byte, RGB/RGBA, +/- RowBytes, any Bounds)
+            cp.stride_floats = width * 4;
+            cp.channels = 4;
+            size_t packedFloats = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+            size_t packedBytes = packedFloats * sizeof(float);
+
+            std::vector<float*> d_alloc_ptrs(srcInfos.size(), nullptr);
+            std::vector<float> h_stage(packedFloats);
             bool allocOk = true;
 
-            for (size_t i = 0; i < sourceImages.size(); ++i) {
-                void* hostSrc = nullptr;
-                g_propSuite->propGetPointer(sourceImages[i], kOfxImagePropData, 0, &hostSrc);
-                if (!hostSrc || cudaMalloc(&d_alloc_ptrs[i], frameBytes) != cudaSuccess) {
+            for (size_t i = 0; i < srcInfos.size(); ++i) {
+                const OfxImgInfo& si = srcInfos[i];
+                // Fast direct copy if already contiguous positive-rowBytes RGBA32F with identical bounds
+                bool isExactRgba32F = (si.bitDepth && std::strcmp(si.bitDepth, kOfxBitDepthFloat) == 0 &&
+                                       si.channels == 4 && si.rowBytes == width * 4 * static_cast<int>(sizeof(float)) &&
+                                       si.bounds[0] == outInfo.bounds[0] && si.bounds[1] == outInfo.bounds[1] &&
+                                       si.bounds[2] == outInfo.bounds[2] && si.bounds[3] == outInfo.bounds[3]);
+
+                if (cudaMalloc(&d_alloc_ptrs[i], packedBytes) != cudaSuccess) {
                     allocOk = false;
                     break;
                 }
-                cudaMemcpy(d_alloc_ptrs[i], hostSrc, frameBytes, cudaMemcpyHostToDevice);
+
+                if (isExactRgba32F) {
+                    cudaMemcpy(d_alloc_ptrs[i], si.data, packedBytes, cudaMemcpyHostToDevice);
+                } else {
+                    #pragma omp parallel for schedule(static)
+                    for (int y = 0; y < height; ++y) {
+                        int wy = outInfo.bounds[1] + y;
+                        float* dst_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+                        for (int x = 0; x < width; ++x) {
+                            sample_ofx_pixel_rgba(si, outInfo.bounds[0] + x, wy, dst_row + x * 4);
+                        }
+                    }
+                    cudaMemcpy(d_alloc_ptrs[i], h_stage.data(), packedBytes, cudaMemcpyHostToDevice);
+                }
             }
 
             float* d_out_buf = nullptr;
-            if (allocOk && cudaMalloc(&d_out_buf, frameBytes) == cudaSuccess) {
+            if (allocOk && cudaMalloc(&d_out_buf, packedBytes) == cudaSuccess) {
                 const float** d_frame_arr = nullptr;
-                cudaMalloc(&d_frame_arr, d_alloc_ptrs.size() * sizeof(float*));
-                cudaMemcpy(d_frame_arr, d_alloc_ptrs.data(), d_alloc_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice);
+                bool ok = false;
+                if (cudaMalloc(&d_frame_arr, d_alloc_ptrs.size() * sizeof(float*)) == cudaSuccess) {
+                    cudaMemcpy(d_frame_arr, d_alloc_ptrs.data(), d_alloc_ptrs.size() * sizeof(float*), cudaMemcpyHostToDevice);
 
-                int32_t ref_idx = static_cast<int32_t>(d_alloc_ptrs.size() / 2);
-                bool ok = librenoise::cuda_denoise_device(
-                    d_frame_arr,
-                    static_cast<int32_t>(d_alloc_ptrs.size()),
-                    ref_idx,
-                    d_out_buf,
-                    cp,
-                    nullptr
-                );
-
-                if (ok) {
-                    cudaMemcpy(outData, d_out_buf, frameBytes, cudaMemcpyDeviceToHost);
+                    int32_t ref_idx = static_cast<int32_t>(d_alloc_ptrs.size() / 2);
+                    ok = librenoise::cuda_denoise_device(
+                        d_frame_arr,
+                        static_cast<int32_t>(d_alloc_ptrs.size()),
+                        ref_idx,
+                        d_out_buf,
+                        cp,
+                        nullptr
+                    );
+                    cudaFree(d_frame_arr);
                 }
 
-                cudaFree(d_frame_arr);
+                if (ok) {
+                    bool outExactRgba32F = (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0 &&
+                                            outInfo.channels == 4 &&
+                                            outInfo.rowBytes == width * 4 * static_cast<int>(sizeof(float)));
+                    if (outExactRgba32F) {
+                        cudaMemcpy(outInfo.data, d_out_buf, packedBytes, cudaMemcpyDeviceToHost);
+                    } else {
+                        cudaMemcpy(h_stage.data(), d_out_buf, packedBytes, cudaMemcpyDeviceToHost);
+                        const int outCh = outInfo.channels;
+                        if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0) {
+                            #pragma omp parallel for schedule(static)
+                            for (int y = 0; y < height; ++y) {
+                                auto* dst_row = reinterpret_cast<float*>(
+                                    reinterpret_cast<uint8_t*>(outInfo.data) +
+                                    static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
+                                const float* src_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+                                for (int x = 0; x < width; ++x) {
+                                    if (outCh >= 3) {
+                                        dst_row[x * outCh + 0] = src_row[x * 4 + 0];
+                                        dst_row[x * outCh + 1] = src_row[x * 4 + 1];
+                                        dst_row[x * outCh + 2] = src_row[x * 4 + 2];
+                                        if (outCh >= 4) dst_row[x * outCh + 3] = src_row[x * 4 + 3];
+                                    } else if (outCh == 1) {
+                                        dst_row[x] = src_row[x * 4 + 0];
+                                    }
+                                }
+                            }
+                        } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthShort) == 0) {
+                            #pragma omp parallel for schedule(static)
+                            for (int y = 0; y < height; ++y) {
+                                auto* dst_row = reinterpret_cast<uint16_t*>(
+                                    reinterpret_cast<uint8_t*>(outInfo.data) +
+                                    static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
+                                const float* src_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+                                for (int x = 0; x < width; ++x) {
+                                    for (int c = 0; c < std::min(outCh, 4); ++c) {
+                                        dst_row[x * outCh + c] = static_cast<uint16_t>(std::clamp(src_row[x * 4 + c] * 65535.0f, 0.0f, 65535.0f));
+                                    }
+                                }
+                            }
+                        } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthByte) == 0) {
+                            #pragma omp parallel for schedule(static)
+                            for (int y = 0; y < height; ++y) {
+                                auto* dst_row = reinterpret_cast<uint8_t*>(outInfo.data) +
+                                                static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes);
+                                const float* src_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+                                for (int x = 0; x < width; ++x) {
+                                    for (int c = 0; c < std::min(outCh, 4); ++c) {
+                                        dst_row[x * outCh + c] = static_cast<uint8_t>(std::clamp(src_row[x * 4 + c] * 255.0f, 0.0f, 255.0f));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 cudaFree(d_out_buf);
                 for (auto ptr : d_alloc_ptrs) if (ptr) cudaFree(ptr);
 
@@ -1105,42 +1287,33 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
             } else {
                 for (auto ptr : d_alloc_ptrs) if (ptr) cudaFree(ptr);
             }
-#endif
         }
+#endif
     }
 
     // =========================================================================
-    // Track A: Multi-threaded AVX2 CPU Fallback
+    // Track A: Multi-threaded AVX2 CPU Pipeline
     // =========================================================================
     std::vector<librenoise::VideoFrame32F> frameWindow;
-    frameWindow.reserve(sourceImages.size());
+    frameWindow.reserve(srcInfos.size());
+    librenoise::ImagePlane32F refAlpha(width, height);
+    size_t refIdx = srcInfos.size() / 2;
 
-    for (auto img : sourceImages) {
-        void* srcData = nullptr;
-        g_propSuite->propGetPointer(img, kOfxImagePropData, 0, &srcData);
-        int srcRowBytes = 0;
-        g_propSuite->propGetInt(img, kOfxImagePropRowBytes, 0, &srcRowBytes);
-
+    for (size_t i = 0; i < srcInfos.size(); ++i) {
+        const OfxImgInfo& si = srcInfos[i];
         librenoise::VideoFrame32F f(width, height);
+        bool saveAlpha = (i == refIdx);
 
-        if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
-            auto* s = reinterpret_cast<float*>(srcData);
-            int floatStride = srcRowBytes / sizeof(float);
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    f.channels[0].at(x, y) = s[y * floatStride + x * 4 + 0];
-                    f.channels[1].at(x, y) = s[y * floatStride + x * 4 + 1];
-                    f.channels[2].at(x, y) = s[y * floatStride + x * 4 + 2];
-                }
-            }
-        } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
-            auto* s = reinterpret_cast<uint8_t*>(srcData);
-            for (int y = 0; y < height; ++y) {
-                for (int x = 0; x < width; ++x) {
-                    f.channels[0].at(x, y) = s[y * srcRowBytes + x * 4 + 0] / 255.0f;
-                    f.channels[1].at(x, y) = s[y * srcRowBytes + x * 4 + 1] / 255.0f;
-                    f.channels[2].at(x, y) = s[y * srcRowBytes + x * 4 + 2] / 255.0f;
-                }
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; ++y) {
+            int wy = outInfo.bounds[1] + y;
+            for (int x = 0; x < width; ++x) {
+                float rgba[4];
+                sample_ofx_pixel_rgba(si, outInfo.bounds[0] + x, wy, rgba);
+                f.channels[0].at(x, y) = rgba[0];
+                f.channels[1].at(x, y) = rgba[1];
+                f.channels[2].at(x, y) = rgba[2];
+                if (saveAlpha) refAlpha.at(x, y) = rgba[3];
             }
         }
         frameWindow.push_back(std::move(f));
@@ -1155,6 +1328,8 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     config.filter_params.early_exit_motion = (earlyExitMotion != 0);
     config.filter_params.temporal_weight = static_cast<float>(tempStrength);
     config.filter_params.spatial_weight = static_cast<float>(spatStrength);
+    config.filter_params.chroma_scale_cr = static_cast<float>(chromaCr);
+    config.filter_params.chroma_scale_cb = static_cast<float>(chromaCb);
 
     config.filter_params.band_weights[0] = static_cast<float>(bandVL);
     config.filter_params.band_weights[1] = static_cast<float>(bandL);
@@ -1162,23 +1337,28 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     config.filter_params.band_weights[3] = static_cast<float>(bandH);
     config.filter_params.band_weights[4] = static_cast<float>(bandVH);
 
+    config.filter_params.tonal_lut[0] = static_cast<float>(tonalSh);
+    config.filter_params.tonal_lut[1] = static_cast<float>(tonalDM);
+    config.filter_params.tonal_lut[2] = static_cast<float>(tonalMid);
+    config.filter_params.tonal_lut[3] = static_cast<float>(tonalLM);
+    config.filter_params.tonal_lut[4] = static_cast<float>(tonalHi);
+
     config.detail_params.detail_recovery = static_cast<float>(detailRec);
     config.detail_params.grain_amount = static_cast<float>(grainAmt);
 
     librenoise::VideoDenoiser denoiser(config);
-    librenoise::VideoFrame32F denoised = denoiser.process_window(frameWindow);
+    librenoise::VideoFrame32F denoised = denoiser.process_window(frameWindow, &activeProfile);
 
-    size_t refIdx = frameWindow.size() / 2;
     const auto& refFrame = frameWindow[refIdx];
-
-    // Write back to host buffer with tonal/chroma and mix blending
     float mixFactor = static_cast<float>(mixWithOriginal);
+    const int outCh = outInfo.channels;
 
-    if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
-        auto* dstPtr = reinterpret_cast<float*>(outData);
-        int floatStride = outRowBytes / sizeof(float);
-
+    if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0) {
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; ++y) {
+            auto* dstRow = reinterpret_cast<float*>(
+                reinterpret_cast<uint8_t*>(outInfo.data) +
+                static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
             for (int x = 0; x < width; ++x) {
                 float r = denoised.channels[0].at(x, y);
                 float g = denoised.channels[1].at(x, y);
@@ -1198,39 +1378,60 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     b = b * (1.0f - mixFactor) + rawB * mixFactor;
                 }
 
-                dstPtr[y * floatStride + x * 4 + 0] = std::clamp(r, 0.0f, 1.0f);
-                dstPtr[y * floatStride + x * 4 + 1] = std::clamp(g, 0.0f, 1.0f);
-                dstPtr[y * floatStride + x * 4 + 2] = std::clamp(b, 0.0f, 1.0f);
-                dstPtr[y * floatStride + x * 4 + 3] = 1.0f;
+                // Preserve linear-light HDR values > 1.0f and original source alpha
+                if (outCh >= 3) {
+                    dstRow[x * outCh + 0] = std::max(0.0f, r);
+                    dstRow[x * outCh + 1] = std::max(0.0f, g);
+                    dstRow[x * outCh + 2] = std::max(0.0f, b);
+                    if (outCh >= 4) dstRow[x * outCh + 3] = refAlpha.at(x, y);
+                } else if (outCh == 1) {
+                    dstRow[x] = std::max(0.0f, r);
+                }
             }
         }
-    } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
-        auto* dstPtr = reinterpret_cast<uint8_t*>(outData);
-
+    } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthShort) == 0) {
+        #pragma omp parallel for schedule(static)
         for (int y = 0; y < height; ++y) {
+            auto* dstRow = reinterpret_cast<uint16_t*>(
+                reinterpret_cast<uint8_t*>(outInfo.data) +
+                static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes));
             for (int x = 0; x < width; ++x) {
-                float r = denoised.channels[0].at(x, y);
-                float g = denoised.channels[1].at(x, y);
-                float b = denoised.channels[2].at(x, y);
-
-                float rawR = refFrame.channels[0].at(x, y);
-                float rawG = refFrame.channels[1].at(x, y);
-                float rawB = refFrame.channels[2].at(x, y);
-
-                if (previewMode == 1) {
-                    r = (rawR - r) * 2.0f + 0.5f;
-                    g = (rawG - g) * 2.0f + 0.5f;
-                    b = (rawB - b) * 2.0f + 0.5f;
-                } else if (mixFactor > 0.0f) {
-                    r = r * (1.0f - mixFactor) + rawR * mixFactor;
-                    g = g * (1.0f - mixFactor) + rawG * mixFactor;
-                    b = b * (1.0f - mixFactor) + rawB * mixFactor;
+                float rgb[4] = {
+                    denoised.channels[0].at(x, y),
+                    denoised.channels[1].at(x, y),
+                    denoised.channels[2].at(x, y),
+                    refAlpha.at(x, y)
+                };
+                float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
+                for (int c = 0; c < 3; ++c) {
+                    if (previewMode == 1) rgb[c] = (raw[c] - rgb[c]) * 2.0f + 0.5f;
+                    else if (mixFactor > 0.0f) rgb[c] = rgb[c] * (1.0f - mixFactor) + raw[c] * mixFactor;
                 }
-
-                dstPtr[y * outRowBytes + x * 4 + 0] = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
-                dstPtr[y * outRowBytes + x * 4 + 1] = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
-                dstPtr[y * outRowBytes + x * 4 + 2] = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
-                dstPtr[y * outRowBytes + x * 4 + 3] = 255;
+                for (int c = 0; c < std::min(outCh, 4); ++c) {
+                    dstRow[x * outCh + c] = static_cast<uint16_t>(std::clamp(rgb[c] * 65535.0f, 0.0f, 65535.0f));
+                }
+            }
+        }
+    } else if (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthByte) == 0) {
+        #pragma omp parallel for schedule(static)
+        for (int y = 0; y < height; ++y) {
+            auto* dstRow = reinterpret_cast<uint8_t*>(outInfo.data) +
+                           static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(outInfo.rowBytes);
+            for (int x = 0; x < width; ++x) {
+                float rgb[4] = {
+                    denoised.channels[0].at(x, y),
+                    denoised.channels[1].at(x, y),
+                    denoised.channels[2].at(x, y),
+                    refAlpha.at(x, y)
+                };
+                float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
+                for (int c = 0; c < 3; ++c) {
+                    if (previewMode == 1) rgb[c] = (raw[c] - rgb[c]) * 2.0f + 0.5f;
+                    else if (mixFactor > 0.0f) rgb[c] = rgb[c] * (1.0f - mixFactor) + raw[c] * mixFactor;
+                }
+                for (int c = 0; c < std::min(outCh, 4); ++c) {
+                    dstRow[x * outCh + c] = static_cast<uint8_t>(std::clamp(rgb[c] * 255.0f, 0.0f, 255.0f));
+                }
             }
         }
     }
@@ -1252,6 +1453,7 @@ OfxStatus plugin_main_entry(
         return action_load();
     }
     if (std::strcmp(action, kOfxActionUnload) == 0) {
+        librenoise::release_cuda_resources();
         return kOfxStatOK;
     }
     if (std::strcmp(action, kOfxActionDescribe) == 0) {

@@ -1,11 +1,25 @@
 #include "librenoise/librenoise.hpp"
+#include "librenoise/gpu_denoiser.hpp"
 #include "librenoise/roi_analyzer.hpp"
 #include "librenoise/profile_curve.hpp"
 #include "librenoise/profile_io.hpp"
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+#include <cuda_runtime.h>
+#endif
 #include <iostream>
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
+#include <random>
+
+#define LN_REQUIRE(cond)                                                               \
+    do {                                                                               \
+        if (!(cond)) {                                                                 \
+            std::cerr << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": " #cond "\n"; \
+            std::exit(1);                                                              \
+        }                                                                              \
+    } while (0)
 
 using namespace librenoise;
 
@@ -211,6 +225,158 @@ void test_motion_field_resilience() {
     std::cout << "  -> Passed: Uninitialized/cut MotionField handles boundaries safely.\n";
 }
 
+void test_gpu_cpu_correlated_grain_parity() {
+    std::cout << "[Test] Running correlated grain PSD & GPU/CPU parity test...\n";
+    const int w = 160;
+    const int h = 128;
+    const int stride = w * 4;
+    const int num_frames = 3;
+    const int ref_idx = 1;
+
+    std::vector<VideoFrame32F> clean_frames(num_frames, VideoFrame32F(w, h, 3));
+    std::vector<VideoFrame32F> noisy_frames(num_frames, VideoFrame32F(w, h, 3));
+    std::vector<std::vector<float>> rgba_frames(num_frames, std::vector<float>(stride * h, 1.0f));
+
+    std::mt19937 rng(1337);
+    std::normal_distribution<float> norm(0.0f, 1.0f);
+
+    for (int f = 0; f < num_frames; ++f) {
+        int dx = (f - ref_idx) * 3;
+        int dy = (f - ref_idx) * 1;
+        std::vector<float> raw(w * h * 3);
+        for (float& v : raw) v = norm(rng);
+
+        for (int y = 0; y < h; ++y) {
+            for (int x = 0; x < w; ++x) {
+                int sx = std::clamp(x + dx, 0, w - 1);
+                int sy = std::clamp(y + dy, 0, h - 1);
+                // Include flat region on left, midtone ramp, and HDR > 1.0 highlight patch on right
+                float clean = 0.12f;
+                if (sx > 96 && sy > 32 && sy < 96) {
+                    clean = 2.25f; // HDR scene-linear highlight (> 1.0)
+                } else if (sx > 64) {
+                    clean = 0.35f;
+                }
+
+                for (int c = 0; c < 3; ++c) {
+                    float corr = 0.0f;
+                    for (int ky = -1; ky <= 1; ++ky) {
+                        for (int kx = -1; kx <= 1; ++kx) {
+                            int nx = std::clamp(x + kx, 0, w - 1);
+                            int ny = std::clamp(y + ky, 0, h - 1);
+                            corr += raw[(ny * w + nx) * 3 + c];
+                        }
+                    }
+                    corr /= 3.0f;
+                    float fine = raw[(y * w + x) * 3 + c];
+                    float sigma = std::sqrt(0.00025f * clean + 0.00015f);
+                    float val = std::max(0.0f, clean + (0.8f * corr + 0.2f * fine) * sigma);
+                    clean_frames[f].channels[c].at(x, y) = clean;
+                    noisy_frames[f].channels[c].at(x, y) = val;
+                    rgba_frames[f][y * stride + x * 4 + c] = val;
+                }
+            }
+        }
+    }
+
+    // 1. Verify ROI analyzer detects correlated low-frequency grain energy (measured_psd[0] > 1.25f)
+    AnalysisRoi flat_roi{8, 16, 48, 96};
+    RoiAnalysisResult roi_res = NoiseRoiAnalyzer::analyze_roi(noisy_frames[ref_idx], flat_roi);
+    LN_REQUIRE(roi_res.sigma_y > 0.008f && roi_res.sigma_y < 0.030f);
+    LN_REQUIRE(roi_res.measured_psd[0] > 1.25f);
+
+    // 2. Verify auto_estimate also populates correlated PSD weights and accurate NLF
+    auto auto_prof = NoiseProfiler::auto_estimate(noisy_frames[ref_idx]);
+    LN_REQUIRE(auto_prof.psd.octave_weights[0][0] > 1.20f);
+
+    auto calc_psnr = [&](const VideoFrame32F& est) {
+        double mse = 0.0;
+        for (int c = 0; c < 3; ++c) {
+            for (int y = 12; y < h - 12; ++y) {
+                for (int x = 12; x < w - 12; ++x) {
+                    double d = est.channels[c].at(x, y) - clean_frames[ref_idx].channels[c].at(x, y);
+                    mse += d * d;
+                }
+            }
+        }
+        mse /= (3.0 * (w - 24) * (h - 24));
+        return 10.0 * std::log10(1.0 / mse);
+    };
+
+    double noisy_psnr = calc_psnr(noisy_frames[ref_idx]);
+
+    VideoDenoiser::Config cfg;
+    cfg.temporal_radius = 1;
+    VideoDenoiser cpu_denoiser(cfg);
+    VideoFrame32F cpu_out = cpu_denoiser.process_window(noisy_frames, &auto_prof);
+    double cpu_psnr = calc_psnr(cpu_out);
+    LN_REQUIRE(cpu_psnr > noisy_psnr + 7.0);
+    // Verify HDR > 1.0 highlight was NOT clipped to 1.0 on CPU
+    LN_REQUIRE(cpu_out.channels[0].at(120, 64) > 2.15f);
+
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+    if (is_cuda_available()) {
+        std::vector<float*> d_ptrs(num_frames, nullptr);
+        for (int f = 0; f < num_frames; ++f) {
+            cudaMalloc(&d_ptrs[f], stride * h * sizeof(float));
+            cudaMemcpy(d_ptrs[f], rgba_frames[f].data(), stride * h * sizeof(float), cudaMemcpyHostToDevice);
+        }
+        const float** d_frame_arr = nullptr;
+        cudaMalloc(&d_frame_arr, num_frames * sizeof(float*));
+        cudaMemcpy(d_frame_arr, d_ptrs.data(), num_frames * sizeof(float*), cudaMemcpyHostToDevice);
+        float* d_out = nullptr;
+        cudaMalloc(&d_out, stride * h * sizeof(float));
+
+        for (int eng = 0; eng < 4; ++eng) {
+            CudaDenoiseParams cp;
+            cp.width = w;
+            cp.height = h;
+            cp.stride_floats = stride;
+            cp.channels = 4;
+            cp.step_size = 4;
+            cp.engine_choice = eng;
+            for (int c = 0; c < 3; ++c) {
+                cp.nlf_a[c] = auto_prof.nlf_per_channel[c].a;
+                cp.nlf_b[c] = auto_prof.nlf_per_channel[c].b;
+                for (int b = 0; b < 5; ++b) {
+                    cp.psd_weights[c][b] = auto_prof.psd.octave_weights[c][b];
+                }
+            }
+
+            bool ok = cuda_denoise_device(d_frame_arr, num_frames, ref_idx, d_out, cp, nullptr);
+            LN_REQUIRE(ok);
+
+            std::vector<float> h_out(stride * h, 0.0f);
+            cudaMemcpy(h_out.data(), d_out, stride * h * sizeof(float), cudaMemcpyDeviceToHost);
+
+            VideoFrame32F gpu_frame(w, h, 3);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        float v = h_out[y * stride + x * 4 + c];
+                        LN_REQUIRE(std::isfinite(v) && v >= 0.0f);
+                        gpu_frame.channels[c].at(x, y) = v;
+                    }
+                }
+            }
+
+            double gpu_psnr = calc_psnr(gpu_frame);
+            std::cout << "  -> Engine " << eng << " GPU PSNR: " << gpu_psnr
+                      << " dB (Noisy: " << noisy_psnr << " dB, CPU V-BM3D: " << cpu_psnr << " dB)\n";
+            LN_REQUIRE(gpu_psnr > noisy_psnr + 6.5);
+            // Verify HDR > 1.0 highlight was NOT clipped or dimmed on GPU
+            LN_REQUIRE(gpu_frame.channels[0].at(120, 64) > 2.15f);
+        }
+
+        cudaFree(d_out);
+        cudaFree(d_frame_arr);
+        for (float* p : d_ptrs) cudaFree(p);
+        release_cuda_resources();
+    }
+#endif
+    std::cout << "  -> Passed: Correlated grain PSD, HDR > 1.0 preservation, and GPU/CPU parity verified.\n";
+}
+
 int main() {
     std::cout << "--- Running LibreNoise Core Unit Tests ---\n";
     test_variance_stabilization();
@@ -220,6 +386,7 @@ int main() {
     test_profile_curve_spline();
     test_profile_serialization();
     test_motion_field_resilience();
+    test_gpu_cpu_correlated_grain_parity();
     std::cout << "ALL TESTS PASSED SUCCESSFULLY!\n";
     return 0;
 }

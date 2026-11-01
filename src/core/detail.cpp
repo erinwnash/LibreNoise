@@ -23,16 +23,16 @@ void DetailEngine::restore_details(
             float residual = raw_val - den_val;
 
             // Local gradient in denoised plane to detect true structural edges
-            float gx = denoised_plane.at(x + 1, y) - denoised_plane.at(x - 1, y);
-            float gy = denoised_plane.at(x, y + 1) - denoised_plane.at(x, y - 1);
+            float gx = (denoised_plane.at(x + 1, y) - denoised_plane.at(x - 1, y)) * 0.5f;
+            float gy = (denoised_plane.at(x, y + 1) - denoised_plane.at(x, y - 1)) * 0.5f;
             float grad_mag = std::sqrt(gx * gx + gy * gy);
 
-            // Threshold against expected noise
+            // Threshold against expected noise; soft-clamp residual so grain spikes aren't re-injected
             float sigma = nlf.sigma_at(den_val);
-            if (grad_mag > 1.5f * sigma) {
-                // Structural edge region: selectively re-inject high-frequency micro-contrast
-                float boost = std::clamp(recovery_strength * (grad_mag / (grad_mag + sigma)), 0.0f, 0.5f);
-                denoised_plane.at(x, y) = std::clamp(den_val + boost * residual, 0.0f, 1.0f);
+            if (grad_mag > 1.8f * sigma) {
+                float capped_res = std::clamp(residual, -1.5f * sigma, 1.5f * sigma);
+                float boost = std::clamp(recovery_strength * (grad_mag / (grad_mag + 2.0f * sigma)), 0.0f, 0.5f);
+                denoised_plane.at(x, y) = std::max(0.0f, den_val + boost * capped_res);
             }
         }
     }
@@ -57,7 +57,7 @@ void DetailEngine::inject_calibrated_grain(
             float val = plane.at(x, y);
             float sigma = nlf.sigma_at(val);
             float noise_sample = dist(rng) * sigma * grain_amount;
-            plane.at(x, y) = std::clamp(val + noise_sample, 0.0f, 1.0f);
+            plane.at(x, y) = std::max(0.0f, val + noise_sample);
         }
     }
 }

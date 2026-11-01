@@ -8,12 +8,21 @@ struct CudaDenoiseParams {
     int32_t width = 0;
     int32_t height = 0;
     int32_t stride_floats = 0;
-    int32_t channels = 4; // 4 for RGBA
+    int32_t channels = 4; // 3 for RGB, 4 for RGBA
     int32_t step_size = 4; // Stride of patches (4 = balanced, 6 = fast, 3 = high quality)
+    int32_t engine_choice = 0; // 0 = Collaborative3D, 1 = Wavelet5Band, 2 = NonLocalMeans, 3 = FrequencyDomain3D
+    int32_t early_exit_motion = 1;
+    int32_t fast_chroma = 1;
     float hard_thresh_lambda = 2.7f;
     float temporal_weight = 1.0f;
     float spatial_weight = 1.0f;
     float band_weights[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    float psd_weights[3][5] = {
+        {1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f, 1.0f}
+    };
+    float tonal_lut[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     float nlf_a[3] = {0.001f, 0.001f, 0.001f};
     float nlf_b[3] = {0.0001f, 0.0001f, 0.0001f};
     float detail_recovery = 0.15f;
@@ -28,6 +37,11 @@ struct CudaDenoiseParams {
  * @brief Checks if CUDA runtime and capable GPU are present.
  */
 bool is_cuda_available() noexcept;
+
+/**
+ * @brief Safely releases cached CUDA device scratch buffers prior to plugin unload.
+ */
+void release_cuda_resources() noexcept;
 
 /**
  * @brief Launch GPU video denoiser on CUDA device pointers.

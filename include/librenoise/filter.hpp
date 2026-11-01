@@ -32,6 +32,10 @@ struct FilterParams {
 
     // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High]
     std::array<float, 5> band_weights{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    std::array<float, 5> tonal_lut{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    float chroma_scale_cb = 1.0f;
+    float chroma_scale_cr = 1.0f;
+    int32_t channel_index = 0;
 
     // Collaborative 3D Parameters
     int32_t patch_size = 8;

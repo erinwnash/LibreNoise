@@ -8,15 +8,30 @@ namespace librenoise {
 
 namespace {
 
-// Evaluates edge gradient energy inside an ROI on a single plane
+inline float sample_box4(const ImagePlane32F& plane, int x, int y) {
+    const int w = plane.width();
+    const int h = plane.height();
+    float sum = 0.0f;
+    for (int dy = 0; dy < 4; ++dy) {
+        int py = std::clamp(y + dy, 0, h - 1);
+        for (int dx = 0; dx < 4; ++dx) {
+            int px = std::clamp(x + dx, 0, w - 1);
+            sum += plane.at(px, py);
+        }
+    }
+    return sum * (1.0f / 16.0f);
+}
+
+// Evaluates structural edge gradient energy inside an ROI using 4x4 box-smoothed samples
+// so sensor grain does not masquerade as image structure.
 float evaluate_patch_gradient(const ImagePlane32F& plane, int x, int y, int w, int h) {
     float grad_sum = 0.0f;
     int count = 0;
 
-    for (int py = y + 1; py < y + h - 1; py += 2) {
-        for (int px = x + 1; px < x + w - 1; px += 2) {
-            float dx = (plane.at(px + 1, py) - plane.at(px - 1, py)) * 0.5f;
-            float dy = (plane.at(px, py + 1) - plane.at(px, py - 1)) * 0.5f;
+    for (int py = y + 2; py < y + h - 4; py += 4) {
+        for (int px = x + 2; px < x + w - 4; px += 4) {
+            float dx = (sample_box4(plane, px + 2, py) - sample_box4(plane, px - 2, py)) * 0.25f;
+            float dy = (sample_box4(plane, px, py + 2) - sample_box4(plane, px, py - 2)) * 0.25f;
             grad_sum += std::sqrt(dx * dx + dy * dy);
             count++;
         }
@@ -24,42 +39,126 @@ float evaluate_patch_gradient(const ImagePlane32F& plane, int x, int y, int w, i
     return count > 0 ? (grad_sum / count) : 1e9f;
 }
 
-// Computes variance consistency across 4 sub-quadrants to verify spatial stationarity
-float evaluate_quadrant_disparity(const ImagePlane32F& plane, int x, int y, int w, int h) {
-    int half_w = w / 2;
-    int half_h = h / 2;
-    float quad_var[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+// Computes planar-detrended variance of a B x B block
+float compute_detrended_block_variance(const ImagePlane32F& plane, int bx, int by, int bs) {
+    const float center = 0.5f * static_cast<float>(bs - 1);
+    const float count = static_cast<float>(bs * bs);
 
-    int qx[4] = {x, x + half_w, x, x + half_w};
-    int qy[4] = {y, y, y + half_h, y + half_h};
-
-    for (int q = 0; q < 4; ++q) {
-        float mean = 0.0f;
-        int count = 0;
-        for (int py = qy[q]; py < qy[q] + half_h; py += 2) {
-            for (int px = qx[q]; px < qx[q] + half_w; px += 2) {
-                mean += plane.at(px, py);
-                count++;
-            }
+    float mean = 0.0f;
+    for (int py = 0; py < bs; ++py) {
+        for (int px = 0; px < bs; ++px) {
+            mean += plane.at(bx + px, by + py);
         }
-        mean = count > 0 ? (mean / count) : 0.0f;
+    }
+    mean /= count;
 
-        float var = 0.0f;
-        for (int py = qy[q]; py < qy[q] + half_h; py += 2) {
-            for (int px = qx[q]; px < qx[q] + half_w; px += 2) {
-                float d = plane.at(px, py) - mean;
-                var += d * d;
-            }
+    float sum_ux = 0.0f;
+    float sum_vy = 0.0f;
+    float denom_u = 0.0f;
+    for (int py = 0; py < bs; ++py) {
+        float dv = static_cast<float>(py) - center;
+        for (int px = 0; px < bs; ++px) {
+            float du = static_cast<float>(px) - center;
+            float val = plane.at(bx + px, by + py) - mean;
+            sum_ux += du * val;
+            sum_vy += dv * val;
+            denom_u += du * du;
         }
-        quad_var[q] = count > 0 ? (var / count) : 0.0f;
     }
 
-    float avg_var = (quad_var[0] + quad_var[1] + quad_var[2] + quad_var[3]) * 0.25f;
-    float max_diff = 0.0f;
-    for (int q = 0; q < 4; ++q) {
-        max_diff = std::max(max_diff, std::abs(quad_var[q] - avg_var));
+    float gx = (denom_u > 1e-6f) ? (sum_ux / denom_u) : 0.0f;
+    float gy = (denom_u > 1e-6f) ? (sum_vy / denom_u) : 0.0f;
+
+    float rss = 0.0f;
+    for (int py = 0; py < bs; ++py) {
+        float dv = static_cast<float>(py) - center;
+        for (int px = 0; px < bs; ++px) {
+            float du = static_cast<float>(px) - center;
+            float res = (plane.at(bx + px, by + py) - mean) - (gx * du + gy * dv);
+            rss += res * res;
+        }
     }
-    return (avg_var > 1e-8f) ? (max_diff / avg_var) : 0.0f;
+
+    float dof = std::max(1.0f, count - 3.0f);
+    return std::max(1e-9f, rss / dof);
+}
+
+// Computes structural range & variance disparity across all 16x16 sub-blocks in an ROI
+// so any pole, fold, or edge passing anywhere through the box is immediately penalized.
+void evaluate_roi_stationarity(
+    const ImagePlane32F& plane, int x, int y, int w, int h,
+    float& out_mean_span, float& out_var_disparity, float& out_clipped_fraction
+) {
+    const int bs = std::min(16, std::min(w, h));
+    const int step = std::max(8, bs);
+    float min_bmean = 1e9f;
+    float max_bmean = -1e9f;
+    std::vector<float> bvars;
+    int zero_count = 0;
+    int total_samples = 0;
+
+    for (int by = y; by <= y + h - bs; by += step) {
+        for (int bx = x; bx <= x + w - bs; bx += step) {
+            float bsum = 0.0f;
+            for (int py = 0; py < bs; py += 2) {
+                for (int px = 0; px < bs; px += 2) {
+                    float v = plane.at(bx + px, by + py);
+                    bsum += v;
+                    if (v <= 1e-5f) zero_count++;
+                    total_samples++;
+                }
+            }
+            float bmean = bsum / static_cast<float>((bs / 2) * (bs / 2));
+            min_bmean = std::min(min_bmean, bmean);
+            max_bmean = std::max(max_bmean, bmean);
+            bvars.push_back(compute_detrended_block_variance(plane, bx, by, bs));
+        }
+    }
+
+    out_mean_span = (max_bmean > min_bmean) ? (max_bmean - min_bmean) : 0.0f;
+    out_clipped_fraction = (total_samples > 0) ? (static_cast<float>(zero_count) / static_cast<float>(total_samples)) : 0.0f;
+
+    if (bvars.size() >= 2) {
+        std::sort(bvars.begin(), bvars.end());
+        float med = bvars[bvars.size() / 2];
+        float p90 = bvars[(bvars.size() * 9) / 10];
+        out_var_disparity = (med > 1e-8f) ? ((p90 - med) / med) : 0.0f;
+    } else {
+        out_var_disparity = 0.0f;
+    }
+}
+
+void dct8x8_forward(const float in[64], float out[64]) {
+    static float mat[8][8];
+    static bool init = false;
+    if (!init) {
+        constexpr float s0 = 0.35355339059327376f;
+        constexpr float s = 0.5f;
+        constexpr double pi = 3.14159265358979323846;
+        for (int k = 0; k < 8; ++k) {
+            float factor = (k == 0) ? s0 : s;
+            for (int n = 0; n < 8; ++n) {
+                mat[k][n] = factor * static_cast<float>(std::cos((pi / 8.0) * (n + 0.5) * k));
+            }
+        }
+        init = true;
+    }
+
+    float tmp[64];
+    for (int r = 0; r < 8; ++r) {
+        for (int k = 0; k < 8; ++k) {
+            float sum = 0.0f;
+            for (int n = 0; n < 8; ++n) sum += mat[k][n] * in[r * 8 + n];
+            tmp[r * 8 + k] = sum;
+        }
+    }
+    for (int c = 0; c < 8; ++c) {
+        for (int k = 0; k < 8; ++k) {
+            float sum = 0.0f;
+            for (int m = 0; m < 8; ++m) sum += mat[k][m] * tmp[m * 8 + c];
+            out[k * 8 + c] = sum;
+        }
+    }
 }
 
 } // anonymous namespace
@@ -104,17 +203,24 @@ AnalysisRoi NoiseRoiAnalyzer::find_optimal_roi(
             }
             mean_val = count > 0 ? (mean_val / count) : 0.5f;
 
-            // Reject clipped regions
-            if (mean_val < 0.03f || mean_val > 0.95f) continue;
+            // Reject clipped-black matte / letterbox or blown super-whites, while supporting scene-linear shadows (0.008+)
+            if (mean_val < 0.008f || mean_val > 2.5f) continue;
+
+            float mean_span = 0.0f, disparity = 0.0f, clipped_frac = 0.0f;
+            evaluate_roi_stationarity(y_plane, x, y, box_w, box_h, mean_span, disparity, clipped_frac);
+            if (clipped_frac > 0.02f) continue;
 
             float grad = evaluate_patch_gradient(y_plane, x, y, box_w, box_h);
-            float disparity = evaluate_quadrant_disparity(y_plane, x, y, box_w, box_h);
+            float norm_scale = std::max(0.05f, mean_val);
+            float rel_grad = grad / norm_scale;
+            float rel_span = mean_span / norm_scale;
 
-            // Exposure bonus for midtones (0.15 to 0.70)
-            float exposure_score = 1.0f - std::abs(mean_val - 0.40f) * 1.5f;
+            // Perceptual midtone preference (~0.04 to 0.45 scene-linear = 24% to 70% sRGB)
+            float perc = std::sqrt(std::clamp(mean_val, 0.0f, 1.0f));
+            float exposure_score = 1.0f - std::abs(perc - 0.42f) * 0.8f;
 
-            // Score: penalizes edges heavily, rewards uniform noise and good exposure
-            float score = exposure_score * 50.0f - grad * 1000.0f - disparity * 30.0f;
+            // Score heavily penalizes any structural edge, curtain fold, or block-mean span inside the ROI
+            float score = exposure_score * 25.0f - rel_grad * 450.0f - rel_span * 120.0f - disparity * 15.0f;
 
             if (score > best_score) {
                 best_score = score;
@@ -144,20 +250,43 @@ RoiAnalysisResult NoiseRoiAnalyzer::analyze_roi(
     const auto& y_plane = frame.channels[0];
     const auto& cb_plane = (frame.channel_count() > 1) ? frame.channels[1] : frame.channels[0];
     const auto& cr_plane = (frame.channel_count() > 2) ? frame.channels[2] : frame.channels[0];
+    const ImagePlane32F* planes[3] = {&y_plane, &cb_plane, &cr_plane};
 
-    // Compute mean intensity
-    float y_sum = 0.0f;
-    int count = 0;
-    for (int y = roi.y; y < roi.y + roi.height; ++y) {
-        for (int x = roi.x; x < roi.x + roi.width; ++x) {
-            y_sum += y_plane.at(x, y);
-            count++;
+    // Compute per-channel mean intensity
+    auto compute_roi_mean = [&](const ImagePlane32F& plane) {
+        double sum = 0.0;
+        int count = 0;
+        for (int y = roi.y; y < roi.y + roi.height; ++y) {
+            for (int x = roi.x; x < roi.x + roi.width; ++x) {
+                sum += plane.at(x, y);
+                count++;
+            }
         }
-    }
-    result.mean_intensity_y = count > 0 ? (y_sum / count) : 0.5f;
+        return count > 0 ? static_cast<float>(sum / count) : 0.5f;
+    };
 
-    // High-pass noise variance estimation (Laplacian kernel avoids smooth gradients)
+    float mean_y = compute_roi_mean(y_plane);
+    float mean_cb = compute_roi_mean(cb_plane);
+    float mean_cr = compute_roi_mean(cr_plane);
+    result.mean_intensity_y = mean_y;
+
+    // Multi-scale planar-detrended block variance estimation:
+    // Cancels smooth lighting gradients while capturing correlated cinema/Bayer grain,
+    // using median across blocks to reject stray dust or edge outliers.
     auto estimate_channel_sigma = [&](const ImagePlane32F& plane) {
+        std::vector<float> block_vars;
+        const int bs = (roi.width >= 16 && roi.height >= 16) ? 16 : 8;
+        const int step = std::max(4, bs / 2);
+
+        if (roi.width >= bs && roi.height >= bs) {
+            for (int by = roi.y; by <= roi.y + roi.height - bs; by += step) {
+                for (int bx = roi.x; bx <= roi.x + roi.width - bs; bx += step) {
+                    block_vars.push_back(compute_detrended_block_variance(plane, bx, by, bs));
+                }
+            }
+        }
+
+        // 1px Laplacian fallback / floor
         float diff_sum = 0.0f;
         int dcount = 0;
         for (int y = roi.y + 1; y < roi.y + roi.height - 1; ++y) {
@@ -169,72 +298,115 @@ RoiAnalysisResult NoiseRoiAnalyzer::analyze_roi(
                 dcount++;
             }
         }
-        // Normalize Laplacian variance scaling factor sqrt(2)
-        return (dcount > 0) ? (std::sqrt(diff_sum / dcount) * 1.4142f) : 0.01f;
+        float lap_var = (dcount > 0) ? ((diff_sum / dcount) * 0.8f) : 1e-6f;
+
+        if (!block_vars.empty()) {
+            std::sort(block_vars.begin(), block_vars.end());
+            float median_var = block_vars[block_vars.size() / 2];
+            return std::sqrt(std::max(median_var, lap_var * 0.5f));
+        }
+        return std::sqrt(std::max(1e-8f, lap_var));
     };
 
     result.sigma_y = estimate_channel_sigma(y_plane);
     result.sigma_cb = estimate_channel_sigma(cb_plane);
     result.sigma_cr = estimate_channel_sigma(cr_plane);
 
-    // Fit heteroscedastic model: sigma^2(I) = a * I + b
+    // Fit heteroscedastic model per channel: sigma^2(I) = a * I + b
     float var_y = result.sigma_y * result.sigma_y;
-    result.nlf_y.a = var_y * 0.6f / std::max(0.05f, result.mean_intensity_y);
-    result.nlf_y.b = var_y * 0.4f;
+    result.nlf_y.a = var_y * 0.5f / std::max(0.05f, mean_y);
+    result.nlf_y.b = var_y * 0.5f;
 
     float var_cb = result.sigma_cb * result.sigma_cb;
-    result.nlf_cb.a = var_cb * 0.6f / std::max(0.05f, result.mean_intensity_y);
-    result.nlf_cb.b = var_cb * 0.4f;
+    result.nlf_cb.a = var_cb * 0.5f / std::max(0.05f, mean_cb);
+    result.nlf_cb.b = var_cb * 0.5f;
 
     float var_cr = result.sigma_cr * result.sigma_cr;
-    result.nlf_cr.a = var_cr * 0.6f / std::max(0.05f, result.mean_intensity_y);
-    result.nlf_cr.b = var_cr * 0.4f;
+    result.nlf_cr.a = var_cr * 0.5f / std::max(0.05f, mean_cr);
+    result.nlf_cr.b = var_cr * 0.5f;
 
-    // Measure 5-band frequency spectrum across 8x8 blocks
-    std::array<float, 5> band_energy{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    int block_count = 0;
+    // Measure 5-band 2D DCT frequency spectrum across 8x8 blocks (sigma_scale relative to base sigma)
+    std::array<double, 5> band_energy{0.0, 0.0, 0.0, 0.0, 0.0};
+    std::array<int64_t, 5> band_counts{0, 0, 0, 0, 0};
+    double total_ac_energy = 0.0;
+    int64_t total_ac_bins = 0;
 
-    for (int by = roi.y; by <= roi.y + roi.height - 8; by += 8) {
-        for (int bx = roi.x; bx <= roi.x + roi.width - 8; bx += 8) {
-            float block_mean = 0.0f;
-            for (int py = 0; py < 8; ++py) {
-                for (int px = 0; px < 8; ++px) {
-                    block_mean += y_plane.at(bx + px, by + py);
+    for (int ch = 0; ch < 3; ++ch) {
+        const auto& pl = *planes[ch];
+        for (int by = roi.y; by <= roi.y + roi.height - 8; by += 8) {
+            for (int bx = roi.x; bx <= roi.x + roi.width - 8; bx += 8) {
+                float patch[64];
+                float mean = 0.0f;
+                for (int py = 0; py < 8; ++py) {
+                    for (int px = 0; px < 8; ++px) {
+                        float v = pl.at(bx + px, by + py);
+                        patch[py * 8 + px] = v;
+                        mean += v;
+                    }
+                }
+                mean /= 64.0f;
+
+                // Detrend linear plane before 2D DCT so smooth ramps don't bias Band 0
+                float sx = 0.0f, sy = 0.0f;
+                for (int py = 0; py < 8; ++py) {
+                    float dv = static_cast<float>(py) - 3.5f;
+                    for (int px = 0; px < 8; ++px) {
+                        float du = static_cast<float>(px) - 3.5f;
+                        float d = patch[py * 8 + px] - mean;
+                        sx += du * d;
+                        sy += dv * d;
+                    }
+                }
+                float gx = sx / 336.0f;
+                float gy = sy / 336.0f;
+                for (int py = 0; py < 8; ++py) {
+                    float dv = static_cast<float>(py) - 3.5f;
+                    for (int px = 0; px < 8; ++px) {
+                        float du = static_cast<float>(px) - 3.5f;
+                        patch[py * 8 + px] = (patch[py * 8 + px] - mean) - (gx * du + gy * dv);
+                    }
+                }
+
+                float spec[64];
+                dct8x8_forward(patch, spec);
+
+                for (int v = 0; v < 8; ++v) {
+                    for (int u = 0; u < 8; ++u) {
+                        if (u == 0 && v == 0) continue; // Skip DC
+                        float r = std::sqrt(static_cast<float>(u * u + v * v));
+                        int band = (r < 1.5f) ? 0 : (r < 3.0f) ? 1 : (r < 5.0f) ? 2 : (r < 7.5f) ? 3 : 4;
+                        double pwr = static_cast<double>(spec[v * 8 + u]) * static_cast<double>(spec[v * 8 + u]);
+                        band_energy[band] += pwr;
+                        band_counts[band]++;
+                        total_ac_energy += pwr;
+                        total_ac_bins++;
+                    }
                 }
             }
-            block_mean /= 64.0f;
-
-            for (int py = 0; py < 8; ++py) {
-                for (int px = 0; px < 8; ++px) {
-                    float val = y_plane.at(bx + px, by + py) - block_mean;
-                    float r = std::sqrt(static_cast<float>(px * px + py * py));
-                    int band = (r < 1.5f) ? 0 : (r < 3.0f) ? 1 : (r < 5.0f) ? 2 : (r < 7.5f) ? 3 : 4;
-                    band_energy[band] += val * val;
-                }
-            }
-            block_count++;
         }
     }
 
-    if (block_count > 0) {
-        float total = 0.0f;
+    if (total_ac_bins > 0 && total_ac_energy > 1e-14) {
+        double mean_ac_pwr = total_ac_energy / static_cast<double>(total_ac_bins);
         for (int i = 0; i < 5; ++i) {
-            band_energy[i] /= static_cast<float>(block_count * 12.8f);
-            total += band_energy[i];
-        }
-        float norm_factor = (total > 1e-7f) ? (5.0f / total) : 1.0f;
-        for (int i = 0; i < 5; ++i) {
-            result.measured_psd[i] = std::clamp(band_energy[i] * norm_factor, 0.2f, 3.0f);
+            double band_mean = (band_counts[i] > 0) ? (band_energy[i] / static_cast<double>(band_counts[i])) : mean_ac_pwr;
+            float sigma_scale = static_cast<float>(std::sqrt(std::max(0.0, band_mean / mean_ac_pwr)));
+            result.measured_psd[i] = std::clamp(sigma_scale, 0.65f, 3.0f);
         }
     }
 
-    // Uniformity and quality score
+    // Uniformity and quality score (normalized for both scene-linear and display-referred plates)
     float grad = evaluate_patch_gradient(y_plane, roi.x, roi.y, roi.width, roi.height);
-    float disparity = evaluate_quadrant_disparity(y_plane, roi.x, roi.y, roi.width, roi.height);
+    float mean_span = 0.0f, disparity = 0.0f, clipped_frac = 0.0f;
+    evaluate_roi_stationarity(y_plane, roi.x, roi.y, roi.width, roi.height, mean_span, disparity, clipped_frac);
 
-    float raw_score = 100.0f * std::exp(-grad * 120.0f - disparity * 0.8f);
-    if (result.mean_intensity_y < 0.05f || result.mean_intensity_y > 0.95f) {
-        raw_score *= 0.5f; // Penalize near-black or near-white
+    float norm_scale = std::max(0.06f, result.mean_intensity_y);
+    float rel_span = std::max(0.0f, (mean_span - 1.8f * result.sigma_y) / norm_scale);
+    float rel_grad = std::max(0.0f, (grad - 0.35f * result.sigma_y) / norm_scale);
+
+    float raw_score = 100.0f * std::exp(-rel_grad * 18.0f - rel_span * 3.5f - disparity * 0.35f);
+    if (result.mean_intensity_y < 0.006f || clipped_frac > 0.05f) {
+        raw_score *= 0.4f; // Penalize clipped black / letterbox matte
     }
     result.uniformity_score = std::clamp(raw_score, 0.0f, 99.9f);
 

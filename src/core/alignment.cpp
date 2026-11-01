@@ -117,6 +117,7 @@ MotionField MotionEstimator::estimate(
             const int32_t fine_max_x = std::min(w - bs, ref_x + best_dx + 1);
             const int32_t fine_min_y = std::max(0, ref_y + best_dy - 1);
             const int32_t fine_max_y = std::min(h - bs, ref_y + best_dy + 1);
+            float fine_min_sad = 1e9f;
 
             for (int32_t cy = fine_min_y; cy <= fine_max_y; ++cy) {
                 for (int32_t cx = fine_min_x; cx <= fine_max_x; ++cx) {
@@ -128,16 +129,16 @@ MotionField MotionEstimator::estimate(
                             current_sad += std::abs(r - t);
                         }
                     }
-                    if (current_sad < min_sad) {
-                        min_sad = current_sad;
+                    if (current_sad < fine_min_sad) {
+                        fine_min_sad = current_sad;
                         best_dx = cx - ref_x;
                         best_dy = cy - ref_y;
                     }
                 }
             }
 
-            // Mean squared error per pixel
-            float mse = (min_sad / static_cast<float>(bs * bs));
+            // Mean absolute error per pixel
+            float mse = (fine_min_sad / static_cast<float>(bs * bs));
 
             MotionVector mv;
             mv.dx = static_cast<int16_t>(best_dx);

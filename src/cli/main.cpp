@@ -1,9 +1,15 @@
 #include "librenoise/librenoise.hpp"
 #include "librenoise/gpu_denoiser.hpp"
+#include "librenoise/roi_analyzer.hpp"
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
 #include <cuda_runtime.h>
 #endif
 #include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
+#include <cstring>
+#include <cctype>
 #include <vector>
 #include <random>
 #include <cmath>
@@ -88,11 +94,192 @@ struct EngineBenchmarkResult {
     double res_energy;
 };
 
+uint32_t bswap32(uint32_t v) {
+    return ((v >> 24) & 0xffu) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | ((v << 24) & 0xff000000u);
+}
+
+float cineon_10bit_to_linear(uint32_t cv) {
+    const double black_pow = std::pow(10.0, (95.0 - 685.0) * (0.002 / 0.6));
+    const double val_pow = std::pow(10.0, (static_cast<double>(cv) - 685.0) * (0.002 / 0.6));
+    return static_cast<float>(std::max(0.0, (val_pow - black_pow) / (1.0 - black_pow)));
+}
+
+bool load_dpx_frame(const std::filesystem::path& path, VideoFrame32F& out_frame, std::vector<float>& out_rgba) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    uint8_t hdr[1024] = {};
+    f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    if (!f) return false;
+
+    bool big_endian = (hdr[0] == 'S' && hdr[1] == 'D' && hdr[2] == 'P' && hdr[3] == 'X');
+    bool little_endian = (hdr[0] == 'X' && hdr[1] == 'P' && hdr[2] == 'D' && hdr[3] == 'S');
+    if (!big_endian && !little_endian) return false;
+
+    auto rd32 = [&](size_t off) {
+        uint32_t v = 0;
+        std::memcpy(&v, hdr + off, sizeof(uint32_t));
+        return big_endian ? bswap32(v) : v;
+    };
+
+    uint32_t data_offset = rd32(4);
+    uint32_t width = rd32(772);
+    uint32_t height = rd32(776);
+    uint8_t transfer = hdr[801];
+    uint8_t bit_depth = hdr[803];
+    if (width == 0 || height == 0 || bit_depth != 10) return false;
+
+    float lut[1024];
+    for (uint32_t i = 0; i < 1024; ++i) {
+        // Transfer 1 or 2 = Printing Density / Logarithmic (Cineon)
+        lut[i] = (transfer == 1 || transfer == 2) ? cineon_10bit_to_linear(i) : (static_cast<float>(i) / 1023.0f);
+    }
+
+    f.seekg(data_offset, std::ios::beg);
+    std::vector<uint32_t> words(static_cast<size_t>(width) * height);
+    f.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(uint32_t)));
+    if (!f) return false;
+
+    out_frame = VideoFrame32F(static_cast<int32_t>(width), static_cast<int32_t>(height), 3);
+    out_rgba.assign(static_cast<size_t>(width) * height * 4, 1.0f);
+
+    #pragma omp parallel for
+    for (int y = 0; y < static_cast<int>(height); ++y) {
+        for (int x = 0; x < static_cast<int>(width); ++x) {
+            size_t idx = static_cast<size_t>(y) * width + x;
+            uint32_t w32 = big_endian ? bswap32(words[idx]) : words[idx];
+            uint32_t r10 = (w32 >> 22) & 0x3ffu;
+            uint32_t g10 = (w32 >> 12) & 0x3ffu;
+            uint32_t b10 = (w32 >> 2) & 0x3ffu;
+            float r = lut[r10], g = lut[g10], b = lut[b10];
+            out_frame.channels[0].at(x, y) = r;
+            out_frame.channels[1].at(x, y) = g;
+            out_frame.channels[2].at(x, y) = b;
+            out_rgba[idx * 4 + 0] = r;
+            out_rgba[idx * 4 + 1] = g;
+            out_rgba[idx * 4 + 2] = b;
+        }
+    }
+    return true;
+}
+
+int run_dpx_benchmark(const std::string& dpx_arg) {
+    std::vector<std::filesystem::path> files;
+    std::filesystem::path p(dpx_arg);
+    if (std::filesystem::is_directory(p)) {
+        for (const auto& entry : std::filesystem::directory_iterator(p)) {
+            if (entry.is_regular_file()) {
+                auto ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (ext == ".dpx") files.push_back(entry.path());
+            }
+        }
+        std::sort(files.begin(), files.end());
+    } else if (std::filesystem::is_regular_file(p)) {
+        files.push_back(p);
+    }
+
+    if (files.empty()) {
+        std::cerr << "[!] No .dpx files found at: " << dpx_arg << "\n";
+        return 1;
+    }
+
+    size_t count = std::min<size_t>(5, files.size());
+    size_t ref_idx = count / 2;
+    std::vector<VideoFrame32F> frames(count);
+    std::vector<std::vector<float>> rgba(count);
+
+    std::cout << "[*] Loading " << count << " Cineon DPX frames from " << files[0].filename().string() << " ...\n";
+    for (size_t i = 0; i < count; ++i) {
+        if (!load_dpx_frame(files[i], frames[i], rgba[i])) {
+            std::cerr << "[!] Failed to parse 10-bit DPX: " << files[i].string() << "\n";
+            return 1;
+        }
+    }
+
+    const int W = frames[ref_idx].width;
+    const int H = frames[ref_idx].height;
+    std::cout << "[*] Resolution: " << W << "x" << H << " (Scene-Linear 32-bit Float)\n";
+
+    auto auto_prof = NoiseProfiler::auto_estimate(frames[ref_idx]);
+    auto opt_roi = NoiseRoiAnalyzer::find_optimal_roi(frames[ref_idx], 160, 64);
+    auto roi_res = NoiseRoiAnalyzer::analyze_roi(frames[ref_idx], opt_roi);
+
+    std::cout << "[*] Optimal ROI: [" << opt_roi.x << ", " << opt_roi.y << ", "
+              << opt_roi.width << "x" << opt_roi.height << "] Score: "
+              << std::fixed << std::setprecision(1) << roi_res.uniformity_score
+              << "% (" << roi_res.assessment << ")\n";
+    std::cout << "    Measured ROI Sigma (R/G/B): " << std::setprecision(5)
+              << roi_res.sigma_y << " / " << roi_res.sigma_cb << " / " << roi_res.sigma_cr << "\n";
+
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+    if (is_cuda_available()) {
+        size_t fbytes = static_cast<size_t>(W) * H * 4 * sizeof(float);
+        std::vector<float*> d_ptrs(count, nullptr);
+        for (size_t i = 0; i < count; ++i) {
+            cudaMalloc(&d_ptrs[i], fbytes);
+            cudaMemcpy(d_ptrs[i], rgba[i].data(), fbytes, cudaMemcpyHostToDevice);
+        }
+        const float** d_arr = nullptr;
+        cudaMalloc(&d_arr, count * sizeof(float*));
+        cudaMemcpy(d_arr, d_ptrs.data(), count * sizeof(float*), cudaMemcpyHostToDevice);
+        float* d_out = nullptr;
+        cudaMalloc(&d_out, fbytes);
+
+        CudaDenoiseParams cp;
+        cp.width = W;
+        cp.height = H;
+        cp.stride_floats = W * 4;
+        cp.channels = 4;
+        cp.step_size = 4;
+        for (int c = 0; c < 3; ++c) {
+            cp.nlf_a[c] = auto_prof.nlf_per_channel[c].a;
+            cp.nlf_b[c] = auto_prof.nlf_per_channel[c].b;
+            for (int b = 0; b < 5; ++b) cp.psd_weights[c][b] = auto_prof.psd.octave_weights[c][b];
+        }
+
+        cuda_denoise_device(d_arr, static_cast<int32_t>(count), static_cast<int32_t>(ref_idx), d_out, cp, nullptr);
+        cudaDeviceSynchronize();
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        cuda_denoise_device(d_arr, static_cast<int32_t>(count), static_cast<int32_t>(ref_idx), d_out, cp, nullptr);
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        std::vector<float> h_out(static_cast<size_t>(W) * H * 4);
+        cudaMemcpy(h_out.data(), d_out, fbytes, cudaMemcpyDeviceToHost);
+
+        VideoFrame32F gpu_out(W, H, 3);
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                size_t idx = static_cast<size_t>(y) * W + x;
+                for (int c = 0; c < 3; ++c) gpu_out.channels[c].at(x, y) = h_out[idx * 4 + c];
+            }
+        }
+        auto gpu_roi_res = NoiseRoiAnalyzer::analyze_roi(gpu_out, opt_roi);
+        std::cout << "[*] Full-Frame CUDA GPU Denoise (" << W << "x" << H << ", " << count << " frames): "
+                  << std::setprecision(1) << ms << " ms\n";
+        std::cout << "    Post-GPU Residual Sigma (R/G/B): " << std::setprecision(5)
+                  << gpu_roi_res.sigma_y << " / " << gpu_roi_res.sigma_cb << " / " << gpu_roi_res.sigma_cr << "\n";
+
+        cudaFree(d_out);
+        cudaFree(d_arr);
+        for (auto p_dev : d_ptrs) cudaFree(p_dev);
+        release_cuda_resources();
+    }
+#endif
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--dpx") {
+            return run_dpx_benchmark(argv[i + 1]);
+        }
+    }
     std::cout << "====================================================================\n";
     std::cout << " LibreNoise Multi-Engine Comparative Benchmark v" << LIBRENOISE_VERSION_STRING << "\n";
     std::cout << "====================================================================\n\n";

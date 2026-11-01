@@ -219,6 +219,9 @@ PF_Err handle_render(
         for (int i = 0; i < 3; ++i) {
             cp.nlf_a[i] = autoProf.nlf_per_channel[i].a;
             cp.nlf_b[i] = autoProf.nlf_per_channel[i].b;
+            for (int b = 0; b < 5; ++b) {
+                cp.psd_weights[i][b] = autoProf.psd.octave_weights[i][b];
+            }
         }
 
         // Process via GPU
@@ -255,15 +258,15 @@ PF_Err handle_render(
     cfg.filter_params.engine = DenoiseEngine::Collaborative3D;
     cfg.filter_params.quality = QualityPreset::Balanced;
     VideoDenoiser denoiser(cfg);
-    VideoFrame32F denoised = denoiser.process_window({frame});
+    VideoFrame32F denoised = denoiser.process_window({frame}, &autoProf);
 
-    auto* dst = reinterpret_cast<uint8_t*>(output->data);
+    auto* dst = reinterpret_cast<float*>(output->data);
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
-            dst[y * rowbytes + x * 4 + 0] = src[y * rowbytes + x * 4 + 0]; // A
-            dst[y * rowbytes + x * 4 + 1] = static_cast<uint8_t>(std::clamp(denoised.channels[0].at(x, y) * 255.0f, 0.0f, 255.0f));
-            dst[y * rowbytes + x * 4 + 2] = static_cast<uint8_t>(std::clamp(denoised.channels[1].at(x, y) * 255.0f, 0.0f, 255.0f));
-            dst[y * rowbytes + x * 4 + 3] = static_cast<uint8_t>(std::clamp(denoised.channels[2].at(x, y) * 255.0f, 0.0f, 255.0f));
+            dst[y * floatStride + x * 4 + 0] = std::max(0.0f, denoised.channels[0].at(x, y));
+            dst[y * floatStride + x * 4 + 1] = std::max(0.0f, denoised.channels[1].at(x, y));
+            dst[y * floatStride + x * 4 + 2] = std::max(0.0f, denoised.channels[2].at(x, y));
+            dst[y * floatStride + x * 4 + 3] = src[y * floatStride + x * 4 + 3];
         }
     }
 

@@ -100,23 +100,57 @@ void temporal_dct_inverse(const float* in, float* out, int K) {
     }
 }
 
+inline float eval_tonal_lut_cpu(const std::array<float, 5>& lut, float val) {
+    float t = std::clamp(val, 0.0f, 1.0f) * 4.0f;
+    int idx = std::min(3, std::max(0, static_cast<int>(t)));
+    float frac = t - static_cast<float>(idx);
+    return lut[idx] * (1.0f - frac) + lut[idx + 1] * frac;
+}
+
+inline float effective_sigma_cpu(const NoiseLevelFunction& nlf, const FilterParams& params, float val) {
+    float chroma_mult = (params.channel_index == 0) ? params.chroma_scale_cr
+                      : (params.channel_index == 2) ? params.chroma_scale_cb : 1.0f;
+    return nlf.sigma_at(val) * params.spatial_weight * eval_tonal_lut_cpu(params.tonal_lut, val) * chroma_mult;
+}
+
+inline int band_for_uv_cpu(int u, int v) {
+    float r = std::sqrt(static_cast<float>(u * u + v * v));
+    return (r < 1.5f) ? 0 : (r < 3.0f) ? 1 : (r < 5.0f) ? 2 : (r < 7.5f) ? 3 : 4;
+}
+
+inline float max_band_scale_cpu(const NoisePsd& psd, const FilterParams& params) {
+    size_t ch = static_cast<size_t>(std::clamp(params.channel_index, 0, 2));
+    float m = 1.0f;
+    for (size_t b = 0; b < 5; ++b) {
+        m = std::max(m, psd.octave_weights[ch][b] * params.band_weights[b]);
+    }
+    return m;
+}
+
 // Motion-compensated temporal accumulation helper
 ImagePlane32F compute_temporal_average(
     const std::vector<const ImagePlane32F*>& temporal_planes,
     size_t ref_index,
     const std::vector<const MotionField*>& motion_fields,
-    const NoiseLevelFunction& nlf
+    const NoiseLevelFunction& nlf,
+    const NoisePsd& psd,
+    const FilterParams& params
 ) {
     const int32_t w = temporal_planes[ref_index]->width();
     const int32_t h = temporal_planes[ref_index]->height();
+    if (temporal_planes.size() <= 1 || params.temporal_weight <= 0.01f) {
+        return *temporal_planes[ref_index];
+    }
+
     ImagePlane32F avg(w, h);
+    const float max_b = max_band_scale_cpu(psd, params);
 
     #pragma omp parallel for schedule(dynamic)
     for (int32_t y = 0; y < h; ++y) {
         for (int32_t x = 0; x < w; ++x) {
             float ref_val = temporal_planes[ref_index]->at(x, y);
-            float sigma = nlf.sigma_at(ref_val);
-            float trust_limit = 3.5f * sigma;
+            float sigma = effective_sigma_cpu(nlf, params, ref_val) * max_b;
+            float trust_limit = 3.5f * sigma * params.temporal_weight;
 
             float sum = ref_val;
             float weight_sum = 1.0f;
@@ -155,7 +189,7 @@ ImagePlane32F compute_temporal_average(
 } // anonymous namespace
 
 // =========================================================================
-// Engine 1: 3D Collaborative Transform Filter (BM3D lineage)
+// Engine 1: 3D Collaborative Transform Filter (2-Stage V-BM3D + Non-Local Wiener)
 // =========================================================================
 void CollaborativePatchFilter3D::process_plane(
     const std::vector<const ImagePlane32F*>& temporal_planes,
@@ -166,12 +200,22 @@ void CollaborativePatchFilter3D::process_plane(
     const FilterParams& params,
     ImagePlane32F& output_plane
 ) {
-    (void)psd;
     const int32_t w = output_plane.width();
     const int32_t h = output_plane.height();
-    const int32_t ps = params.patch_size; // 8
-    const int32_t step = params.step_size; // e.g. 3
+    const int32_t ps = 8;
+    const int32_t step = std::max(1, params.step_size);
     const size_t total_pixels = static_cast<size_t>(w * h);
+    const size_t ch_idx = static_cast<size_t>(std::clamp(params.channel_index, 0, 2));
+    const float max_b = max_band_scale_cpu(psd, params);
+    const float feather_1d[8] = {0.38f, 0.68f, 0.92f, 1.0f, 1.0f, 0.92f, 0.68f, 0.38f};
+
+    if (w < ps || h < ps) {
+        output_plane = *temporal_planes[ref_index];
+        return;
+    }
+
+    const int32_t npx = (w - ps + step - 1) / step + 1;
+    const int32_t npy = (h - ps + step - 1) / step + 1;
 
     ImagePlane32F numerator(w, h);
     ImagePlane32F denominator(w, h);
@@ -180,6 +224,7 @@ void CollaborativePatchFilter3D::process_plane(
 
     const ImagePlane32F* ref_plane = temporal_planes[ref_index];
 
+    // Pass 1: Motion-Compensated 3D Hard-Thresholding -> Pilot
     #pragma omp parallel
     {
         ImagePlane32F local_num(w, h);
@@ -188,94 +233,94 @@ void CollaborativePatchFilter3D::process_plane(
         local_den.fill(0.0f);
 
         #pragma omp for schedule(dynamic)
-        for (int32_t y = 0; y <= h - ps; y += step) {
-            for (int32_t x = 0; x <= w - ps; x += step) {
+        for (int32_t iy = 0; iy < npy; ++iy) {
+            int32_t y = std::min(iy * step, h - ps);
+            for (int32_t ix = 0; ix < npx; ++ix) {
+                int32_t x = std::min(ix * step, w - ps);
+
                 float ref_patch[64];
+                float mean_v = 0.0f;
                 for (int32_t py = 0; py < ps; ++py) {
                     for (int32_t px = 0; px < ps; ++px) {
-                        ref_patch[py * 8 + px] = ref_plane->at(x + px, y + py);
+                        float v = ref_plane->at(x + px, y + py);
+                        ref_patch[py * 8 + px] = v;
+                        mean_v += v;
+                    }
+                }
+                mean_v *= (1.0f / 64.0f);
+
+                float sigma = effective_sigma_cpu(nlf, params, mean_v);
+                float eff_sig = sigma * max_b;
+                float trust_dist = 4.5f * std::max(0.25f, params.temporal_weight) * (eff_sig * eff_sig + 1e-6f);
+
+                float group[9][64];
+                std::copy(ref_patch, ref_patch + 64, group[0]);
+                int K = 1;
+
+                if (temporal_planes.size() > 1 && params.temporal_weight > 0.01f) {
+                    for (size_t f = 0; f < temporal_planes.size(); ++f) {
+                        if (f == ref_index || K >= 9) continue;
+
+                        int32_t disp_x = 0, disp_y = 0;
+                        bool trusted = true;
+                        if (motion_fields[f]) {
+                            if (motion_fields[f]->is_valid()) {
+                                auto mv = motion_fields[f]->get_vector_at_pixel(x + 4, y + 4);
+                                disp_x = mv.dx;
+                                disp_y = mv.dy;
+                                trusted = mv.trusted;
+                            } else if (motion_fields[f]->is_scene_cut) {
+                                trusted = false;
+                            }
+                        }
+                        if (!trusted) continue;
+
+                        int32_t cand_x = std::clamp(x + disp_x, 0, w - ps);
+                        int32_t cand_y = std::clamp(y + disp_y, 0, h - ps);
+
+                        float cand_patch[64];
+                        float dist = 0.0f;
+                        for (int32_t py = 0; py < ps; ++py) {
+                            for (int32_t px = 0; px < ps; ++px) {
+                                float cv = temporal_planes[f]->at(cand_x + px, cand_y + py);
+                                cand_patch[py * 8 + px] = cv;
+                                float diff = ref_patch[py * 8 + px] - cv;
+                                dist += diff * diff;
+                            }
+                        }
+                        dist *= (1.0f / 64.0f);
+
+                        if (dist <= trust_dist) {
+                            std::copy(cand_patch, cand_patch + 64, group[K]);
+                            K++;
+                        }
                     }
                 }
 
-                float center_intensity = ref_patch[27];
-                float sigma = nlf.sigma_at(center_intensity);
-                float hard_threshold = params.hard_thresh_lambda * sigma;
+                float spatial_coeffs[9][64];
+                for (int k = 0; k < K; ++k) dct8x8_2d(group[k], spatial_coeffs[k]);
 
-                struct GroupMember {
-                    size_t frame_idx;
-                    int32_t patch_x;
-                    int32_t patch_y;
-                    float patch[64];
-                };
-                std::vector<GroupMember> group;
-                group.reserve(temporal_planes.size());
-
-                GroupMember ref_member{ref_index, x, y, {}};
-                std::copy(ref_patch, ref_patch + 64, ref_member.patch);
-                group.push_back(ref_member);
-
-                for (size_t f = 0; f < temporal_planes.size(); ++f) {
-                    if (f == ref_index) continue;
-
-                    int32_t disp_x = 0, disp_y = 0;
-                    bool trusted = true;
-                    if (motion_fields[f]) {
-                        if (motion_fields[f]->is_valid()) {
-                            auto mv = motion_fields[f]->get_vector_at_pixel(x + ps / 2, y + ps / 2);
-                            disp_x = mv.dx;
-                            disp_y = mv.dy;
-                            trusted = mv.trusted;
-                        } else if (motion_fields[f]->is_scene_cut) {
-                            trusted = false;
-                        }
-                    }
-                    if (!trusted) continue;
-
-                    int32_t cand_x = std::clamp(x + disp_x, 0, w - ps);
-                    int32_t cand_y = std::clamp(y + disp_y, 0, h - ps);
-
-                    GroupMember cand_member{f, cand_x, cand_y, {}};
-                    for (int32_t py = 0; py < ps; ++py) {
-                        for (int32_t px = 0; px < ps; ++px) {
-                            cand_member.patch[py * 8 + px] = temporal_planes[f]->at(cand_x + px, cand_y + py);
-                        }
-                    }
-
-                    float dist = 0.0f;
-                    for (int32_t i = 0; i < 64; ++i) {
-                        float diff = ref_patch[i] - cand_member.patch[i];
-                        dist += diff * diff;
-                    }
-                    dist /= 64.0f;
-
-                    if (dist <= 4.0f * (sigma * sigma + 1e-6f)) {
-                        group.push_back(cand_member);
-                        if (group.size() >= static_cast<size_t>(params.max_group_size)) break;
-                    }
-                }
-
-                int K = static_cast<int>(group.size());
-
-                // Spatial 2D DCT
-                std::vector<std::array<float, 64>> spatial_coeffs(K);
-                for (int k = 0; k < K; ++k) dct8x8_2d(group[k].patch, spatial_coeffs[k].data());
-
-                // Temporal 1D DCT
-                std::vector<std::array<float, 64>> transform_3d(K);
+                float transform_3d[9][64];
                 for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    float temp_in[16], temp_out[16];
+                    float temp_in[9], temp_out[9];
                     for (int k = 0; k < K; ++k) temp_in[k] = spatial_coeffs[k][coeff_idx];
                     temporal_dct_forward(temp_in, temp_out, K);
                     for (int k = 0; k < K; ++k) transform_3d[k][coeff_idx] = temp_out[k];
                 }
 
-                // Collaborative Thresholding
                 int non_zero_count = 0;
-                for (int k = 0; k < K; ++k) {
-                    for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
+                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
+                    int u = coeff_idx & 7;
+                    int v = coeff_idx >> 3;
+                    int band = band_for_uv_cpu(u, v);
+                    float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
+                    float sp_thresh = params.hard_thresh_lambda * sigma * bscale;
+                    float tm_thresh = sp_thresh * std::max(0.5f, params.temporal_weight);
+
+                    for (int k = 0; k < K; ++k) {
                         if (k == 0 && coeff_idx == 0) { non_zero_count++; continue; }
-                        float val = transform_3d[k][coeff_idx];
-                        if (std::abs(val) < hard_threshold) {
+                        float thresh = (k == 0) ? sp_thresh : tm_thresh;
+                        if (std::abs(transform_3d[k][coeff_idx]) < thresh) {
                             transform_3d[k][coeff_idx] = 0.0f;
                         } else {
                             non_zero_count++;
@@ -283,23 +328,214 @@ void CollaborativePatchFilter3D::process_plane(
                     }
                 }
 
-                // Inverse 1D DCT
                 for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    float temp_in[16], temp_out[16];
+                    float temp_in[9], temp_out[9];
                     for (int k = 0; k < K; ++k) temp_in[k] = transform_3d[k][coeff_idx];
                     temporal_dct_inverse(temp_in, temp_out, K);
-                    for (int k = 0; k < K; ++k) spatial_coeffs[k][coeff_idx] = temp_out[k];
+                    spatial_coeffs[0][coeff_idx] = temp_out[0];
                 }
 
-                // Inverse 2D IDCT
                 float filtered_ref_patch[64];
-                idct8x8_2d(spatial_coeffs[0].data(), filtered_ref_patch);
+                idct8x8_2d(spatial_coeffs[0], filtered_ref_patch);
 
-                float weight = 1.0f / (static_cast<float>(std::max(1, non_zero_count)));
+                float inv_nz = 1.0f / static_cast<float>(std::max(1, non_zero_count));
                 for (int32_t py = 0; py < ps; ++py) {
                     for (int32_t px = 0; px < ps; ++px) {
-                        local_num.at(x + px, y + py) += filtered_ref_patch[py * 8 + px] * weight;
-                        local_den.at(x + px, y + py) += weight;
+                        float w_agg = feather_1d[py] * feather_1d[px] * inv_nz;
+                        float fv = std::max(0.0f, filtered_ref_patch[py * 8 + px]);
+                        local_num.at(x + px, y + py) += fv * w_agg;
+                        local_den.at(x + px, y + py) += w_agg;
+                    }
+                }
+            }
+        }
+
+        #pragma omp critical
+        {
+            float* num_ptr = numerator.data();
+            float* den_ptr = denominator.data();
+            const float* lnum_ptr = local_num.data();
+            const float* lden_ptr = local_den.data();
+            for (size_t i = 0; i < total_pixels; ++i) {
+                num_ptr[i] += lnum_ptr[i];
+                den_ptr[i] += lden_ptr[i];
+            }
+        }
+    }
+
+    ImagePlane32F pilot(w, h);
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            float d = denominator.at(x, y);
+            pilot.at(x, y) = (d > 1e-7f) ? (numerator.at(x, y) / d) : ref_plane->at(x, y);
+        }
+    }
+
+    if (!params.enable_wiener_pass) {
+        output_plane = pilot;
+        return;
+    }
+
+    // Pass 2: Spatiotemporal Non-Local Collaborative 3D Empirical Wiener
+    numerator.fill(0.0f);
+    denominator.fill(0.0f);
+
+    #pragma omp parallel
+    {
+        ImagePlane32F local_num(w, h);
+        ImagePlane32F local_den(w, h);
+        local_num.fill(0.0f);
+        local_den.fill(0.0f);
+
+        const int ox_list[12] = {-5,  5,  0,  0, -5,  5, -5,  5, -10, 10,   0,  0};
+        const int oy_list[12] = { 0,  0, -5,  5, -5, -5,  5,  5,   0,  0, -10, 10};
+
+        #pragma omp for schedule(dynamic)
+        for (int32_t iy = 0; iy < npy; ++iy) {
+            int32_t y = std::min(iy * step, h - ps);
+            for (int32_t ix = 0; ix < npx; ++ix) {
+                int32_t x = std::min(ix * step, w - ps);
+
+                float noisy_grp[12][64];
+                float pilot_grp[12][64];
+                float mean_p = 0.0f;
+
+                for (int32_t py = 0; py < ps; ++py) {
+                    for (int32_t px = 0; px < ps; ++px) {
+                        int idx = py * 8 + px;
+                        noisy_grp[0][idx] = ref_plane->at(x + px, y + py);
+                        float pv = pilot.at(x + px, y + py);
+                        pilot_grp[0][idx] = pv;
+                        mean_p += pv;
+                    }
+                }
+                mean_p *= (1.0f / 64.0f);
+
+                float sigma = effective_sigma_cpu(nlf, params, mean_p);
+                float eff_var = (sigma * max_b) * (sigma * max_b) + 1e-7f;
+                int K = 1;
+
+                // Temporal matches
+                if (temporal_planes.size() > 1 && params.temporal_weight > 0.01f) {
+                    float temp_trust = 4.0f * std::max(0.25f, params.temporal_weight) * eff_var;
+                    for (size_t f = 0; f < temporal_planes.size(); ++f) {
+                        if (f == ref_index || K >= 12) continue;
+                        int32_t disp_x = 0, disp_y = 0;
+                        bool trusted = true;
+                        if (motion_fields[f]) {
+                            if (motion_fields[f]->is_valid()) {
+                                auto mv = motion_fields[f]->get_vector_at_pixel(x + 4, y + 4);
+                                disp_x = mv.dx;
+                                disp_y = mv.dy;
+                                trusted = mv.trusted;
+                            } else if (motion_fields[f]->is_scene_cut) {
+                                trusted = false;
+                            }
+                        }
+                        if (!trusted) continue;
+
+                        int32_t cx = std::clamp(x + disp_x, 0, w - ps);
+                        int32_t cy = std::clamp(y + disp_y, 0, h - ps);
+                        float cand_n[64];
+                        float dist = 0.0f;
+                        for (int32_t py = 0; py < ps; ++py) {
+                            for (int32_t px = 0; px < ps; ++px) {
+                                int idx = py * 8 + px;
+                                float cv = temporal_planes[f]->at(cx + px, cy + py);
+                                cand_n[idx] = cv;
+                                float diff = noisy_grp[0][idx] - cv;
+                                dist += diff * diff;
+                            }
+                        }
+                        if (dist * (1.0f / 64.0f) <= temp_trust) {
+                            std::copy(cand_n, cand_n + 64, noisy_grp[K]);
+                            std::copy(pilot_grp[0], pilot_grp[0] + 64, pilot_grp[K]);
+                            K++;
+                        }
+                    }
+                }
+
+                // Spatial non-local matches on denoised pilot
+                if (params.spatial_weight > 0.01f && K < 12) {
+                    float spat_trust = 1.6f * eff_var;
+                    for (int s = 0; s < 12 && K < 12; ++s) {
+                        int32_t sx = x + ox_list[s];
+                        int32_t sy = y + oy_list[s];
+                        if (sx < 0 || sx + ps > w || sy < 0 || sy + ps > h) continue;
+
+                        float cand_p[64];
+                        float dist_p = 0.0f;
+                        for (int32_t py = 0; py < ps; ++py) {
+                            for (int32_t px = 0; px < ps; ++px) {
+                                int idx = py * 8 + px;
+                                float pv = pilot.at(sx + px, sy + py);
+                                cand_p[idx] = pv;
+                                float diff = pilot_grp[0][idx] - pv;
+                                dist_p += diff * diff;
+                            }
+                        }
+                        if (dist_p * (1.0f / 64.0f) <= spat_trust) {
+                            for (int32_t py = 0; py < ps; ++py) {
+                                for (int32_t px = 0; px < ps; ++px) {
+                                    noisy_grp[K][py * 8 + px] = ref_plane->at(sx + px, sy + py);
+                                }
+                            }
+                            std::copy(cand_p, cand_p + 64, pilot_grp[K]);
+                            K++;
+                        }
+                    }
+                }
+
+                float n_spec[12][64], p_spec[12][64];
+                for (int k = 0; k < K; ++k) {
+                    dct8x8_2d(noisy_grp[k], n_spec[k]);
+                    dct8x8_2d(pilot_grp[k], p_spec[k]);
+                }
+
+                float w_sq_sum = 0.0f;
+                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
+                    int u = coeff_idx & 7;
+                    int v = coeff_idx >> 3;
+                    int band = band_for_uv_cpu(u, v);
+                    float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
+                    float nvar = (sigma * bscale) * (sigma * bscale);
+
+                    float ny_in[12], py_in[12], ny_out[12], ny_inv[12];
+                    for (int k = 0; k < K; ++k) {
+                        ny_in[k] = n_spec[k][coeff_idx];
+                        py_in[k] = p_spec[k][coeff_idx];
+                    }
+                    float n_tdct[12], p_tdct[12];
+                    temporal_dct_forward(ny_in, n_tdct, K);
+                    temporal_dct_forward(py_in, p_tdct, K);
+
+                    for (int k = 0; k < K; ++k) {
+                        if (k == 0 && coeff_idx == 0) {
+                            ny_out[0] = n_tdct[0];
+                            w_sq_sum += 1.0f;
+                        } else {
+                            float p2 = p_tdct[k] * p_tdct[k];
+                            float eff_nvar = (k == 0) ? nvar : (nvar * std::max(0.5f, params.temporal_weight));
+                            float w_gain = p2 / (p2 + eff_nvar + 1e-10f);
+                            ny_out[k] = n_tdct[k] * w_gain;
+                            w_sq_sum += w_gain * w_gain;
+                        }
+                    }
+
+                    temporal_dct_inverse(ny_out, ny_inv, K);
+                    n_spec[0][coeff_idx] = ny_inv[0];
+                }
+
+                float wiener_patch[64];
+                idct8x8_2d(n_spec[0], wiener_patch);
+
+                float inv_w = 1.0f / std::max(1e-2f, w_sq_sum);
+                for (int32_t py = 0; py < ps; ++py) {
+                    for (int32_t px = 0; px < ps; ++px) {
+                        float w_agg = feather_1d[py] * feather_1d[px] * inv_w;
+                        float fv = std::max(0.0f, wiener_patch[py * 8 + px]);
+                        local_num.at(x + px, y + py) += fv * w_agg;
+                        local_den.at(x + px, y + py) += w_agg;
                     }
                 }
             }
@@ -321,7 +557,7 @@ void CollaborativePatchFilter3D::process_plane(
     for (int32_t y = 0; y < h; ++y) {
         for (int32_t x = 0; x < w; ++x) {
             float d = denominator.at(x, y);
-            output_plane.at(x, y) = (d > 1e-7f) ? (numerator.at(x, y) / d) : ref_plane->at(x, y);
+            output_plane.at(x, y) = (d > 1e-7f) ? (numerator.at(x, y) / d) : pilot.at(x, y);
         }
     }
 }
@@ -394,9 +630,9 @@ void Wavelet5BandFilter::process_plane(
     const FilterParams& params,
     ImagePlane32F& output_plane
 ) {
-    (void)psd;
     // Step 1: Temporal Motion-Compensated baseline
-    ImagePlane32F current = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf);
+    ImagePlane32F current = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf, psd, params);
+    const size_t ch_idx = static_cast<size_t>(std::clamp(params.channel_index, 0, 2));
 
     const int32_t num_levels = 5;
     std::vector<ImagePlane32F> pyramid(num_levels + 1);
@@ -411,7 +647,9 @@ void Wavelet5BandFilter::process_plane(
 
         details[l] = ImagePlane32F(pyramid[l].width(), pyramid[l].height());
         int band = std::clamp(4 - l, 0, 4); // 4 = Very High down to 0 = Very Low
-        float band_mult = params.band_weights[band];
+        float band_mult = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
+        // Each 2x2 pyramid average halves white noise std (0.5^l)
+        float level_scale = std::pow(0.55f, static_cast<float>(l));
 
         int32_t pw = pyramid[l].width();
         int32_t ph = pyramid[l].height();
@@ -421,12 +659,13 @@ void Wavelet5BandFilter::process_plane(
             for (int32_t x = 0; x < pw; ++x) {
                 float raw_diff = pyramid[l].at(x, y) - up.at(x, y);
                 float base_val = up.at(x, y);
-                float sigma = nlf.sigma_at(base_val);
+                float sigma = effective_sigma_cpu(nlf, params, base_val);
 
-                // Hard shrinkage on detail band (preserves true edge contrast without bias)
-                float thresh = params.wavelet_soft_threshold * sigma * band_mult;
-                float filtered = (std::abs(raw_diff) < thresh) ? 0.0f : raw_diff;
-                details[l].at(x, y) = filtered;
+                // Empirical Wiener shrinkage per octave band (preserves gradients & crisp edges)
+                float thresh = 1.6f * sigma * band_mult * level_scale;
+                float pwr = raw_diff * raw_diff;
+                float gain = std::max(0.0f, (pwr - thresh * thresh) / (pwr + 1e-8f));
+                details[l].at(x, y) = raw_diff * gain;
             }
         }
     }
@@ -443,7 +682,7 @@ void Wavelet5BandFilter::process_plane(
         #pragma omp parallel for schedule(dynamic)
         for (int32_t y = 0; y < rh; ++y) {
             for (int32_t x = 0; x < rw; ++x) {
-                recon.at(x, y) = up.at(x, y) + details[l].at(x, y);
+                recon.at(x, y) = std::max(0.0f, up.at(x, y) + details[l].at(x, y));
             }
         }
     }
@@ -463,9 +702,9 @@ void NonLocalMeansFilter::process_plane(
     const FilterParams& params,
     ImagePlane32F& output_plane
 ) {
-    (void)psd;
     // Step 1: Temporal Motion-Compensated baseline
-    ImagePlane32F temp_accum = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf);
+    ImagePlane32F temp_accum = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf, psd, params);
+    const float max_b = max_band_scale_cpu(psd, params);
 
     const int32_t w = temp_accum.width();
     const int32_t h = temp_accum.height();
@@ -477,7 +716,7 @@ void NonLocalMeansFilter::process_plane(
     for (int32_t y = 0; y < h; ++y) {
         for (int32_t x = 0; x < w; ++x) {
             float center_val = temp_accum.at(x, y);
-            float sigma = nlf.sigma_at(center_val);
+            float sigma = effective_sigma_cpu(nlf, params, center_val) * max_b;
             float h_sq = params.nlm_h_factor * sigma * sigma * 2.0f + 1e-6f;
 
             float weight_sum = 0.0f;
@@ -524,14 +763,22 @@ void FrequencyDomainFilter3D::process_plane(
     const FilterParams& params,
     ImagePlane32F& output_plane
 ) {
-    (void)psd;
     // Step 1: Temporal motion-compensated pre-estimate
-    ImagePlane32F temp_accum = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf);
+    ImagePlane32F temp_accum = compute_temporal_average(temporal_planes, ref_index, motion_fields, nlf, psd, params);
+    const size_t ch_idx = static_cast<size_t>(std::clamp(params.channel_index, 0, 2));
 
     const int32_t w = temp_accum.width();
     const int32_t h = temp_accum.height();
     const int32_t bs = 8;
     const int32_t step = 4; // Overlapping sliding blocks
+
+    if (w < bs || h < bs) {
+        output_plane = temp_accum;
+        return;
+    }
+
+    const int32_t npx = (w - bs + step - 1) / step + 1;
+    const int32_t npy = (h - bs + step - 1) / step + 1;
 
     ImagePlane32F numerator(w, h);
     ImagePlane32F denominator(w, h);
@@ -546,17 +793,22 @@ void FrequencyDomainFilter3D::process_plane(
         local_den.fill(0.0f);
 
         #pragma omp for schedule(dynamic)
-        for (int32_t y = 0; y <= h - bs; y += step) {
-            for (int32_t x = 0; x <= w - bs; x += step) {
+        for (int32_t iy = 0; iy < npy; ++iy) {
+            int32_t y = std::min(iy * step, h - bs);
+            for (int32_t ix = 0; ix < npx; ++ix) {
+                int32_t x = std::min(ix * step, w - bs);
                 float block[64];
+                float mean_v = 0.0f;
                 for (int32_t py = 0; py < bs; ++py) {
                     for (int32_t px = 0; px < bs; ++px) {
-                        block[py * 8 + px] = temp_accum.at(x + px, y + py);
+                        float v = temp_accum.at(x + px, y + py);
+                        block[py * 8 + px] = v;
+                        mean_v += v;
                     }
                 }
+                mean_v *= (1.0f / 64.0f);
 
-                float center_intensity = block[27];
-                float sigma = nlf.sigma_at(center_intensity);
+                float sigma = effective_sigma_cpu(nlf, params, mean_v);
 
                 // 2D DCT Transform
                 float spectrum[64];
@@ -567,17 +819,11 @@ void FrequencyDomainFilter3D::process_plane(
                     for (int u = 0; u < 8; ++u) {
                         if (u == 0 && v == 0) continue; // Keep DC
 
-                        float r = std::sqrt(static_cast<float>(u * u + v * v));
-                        int band = 2; // Mid default
-                        if (r < 1.5f) band = 0;      // Very Low
-                        else if (r < 3.0f) band = 1; // Low
-                        else if (r < 5.0f) band = 2; // Mid
-                        else if (r < 7.5f) band = 3; // High
-                        else band = 4;               // Very High
-
+                        int band = band_for_uv_cpu(u, v);
+                        float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
                         float coeff = spectrum[v * 8 + u];
                         float pwr = coeff * coeff;
-                        float noise_pwr = sigma * sigma * params.band_weights[band];
+                        float noise_pwr = (sigma * bscale) * (sigma * bscale);
 
                         // Wiener empirical spectral shrinkage
                         float gain = std::max(0.0f, (pwr - noise_pwr) / (pwr + 1e-7f));
@@ -591,7 +837,7 @@ void FrequencyDomainFilter3D::process_plane(
 
                 for (int32_t py = 0; py < bs; ++py) {
                     for (int32_t px = 0; px < bs; ++px) {
-                        local_num.at(x + px, y + py) += filtered_block[py * 8 + px];
+                        local_num.at(x + px, y + py) += std::max(0.0f, filtered_block[py * 8 + px]);
                         local_den.at(x + px, y + py) += 1.0f;
                     }
                 }
@@ -676,8 +922,9 @@ void FilterDispatcher::process(
         for (const auto& mf : motion_fields) mf_ptrs.push_back(&mf);
 
         FilterParams channel_params = active_params;
+        channel_params.channel_index = static_cast<int32_t>(c);
         if (c > 0 && active_params.fast_chroma) {
-            channel_params.step_size = std::min(active_params.step_size * 2, 8);
+            channel_params.step_size = std::min(active_params.step_size + 2, 6);
         }
 
         const auto& nlf = profile.nlf_per_channel[std::min(c, size_t{2})];

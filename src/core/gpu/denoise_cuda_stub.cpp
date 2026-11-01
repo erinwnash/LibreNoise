@@ -8,6 +8,8 @@ bool is_cuda_available() noexcept {
     return false;
 }
 
+void release_cuda_resources() noexcept {}
+
 bool cuda_denoise_device(
     const float* const* /*d_input_frames*/,
     int32_t /*frame_count*/,

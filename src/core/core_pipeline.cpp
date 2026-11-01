@@ -21,7 +21,9 @@ VideoFrame32F VideoDenoiser::process_window(
 
     // Stage 1: Noise profile resolution
     NoiseProfile active_profile;
-    if (profile && !profile->profile_name.empty()) {
+    if (profile && (!profile->profile_name.empty() ||
+                    profile->nlf_per_channel[0].a > 0.0f ||
+                    profile->nlf_per_channel[0].b > 0.0f)) {
         active_profile = *profile;
     } else {
         active_profile = NoiseProfiler::auto_estimate(ref_frame);

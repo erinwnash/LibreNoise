@@ -1,3 +1,5 @@
+find_package(OpenMP)
+
 add_library(librenoise_core STATIC
     noise_model.cpp
     alignment.cpp
@@ -15,7 +17,11 @@ target_include_directories(librenoise_core
 target_compile_features(librenoise_core PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(librenoise_core PRIVATE /W4 /arch:AVX2 /fp:fast)
+    target_compile_options(librenoise_core PRIVATE /W4 /arch:AVX2 /fp:fast /openmp)
 else()
-    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -mavx2 -mfma -ffast-math)
+    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -mavx2 -mfma -ffast-math -fopenmp)
+endif()
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(librenoise_core PUBLIC OpenMP::OpenMP_CXX)
 endif()

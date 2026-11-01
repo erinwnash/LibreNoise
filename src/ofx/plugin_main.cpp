@@ -1,7 +1,13 @@
 #include "openfx/ofxCore.h"
+#include "openfx/ofxProperty.h"
+#include "openfx/ofxParam.h"
 #include "openfx/ofxImageEffect.h"
 #include "librenoise/librenoise.hpp"
+
 #include <cstring>
+#include <algorithm>
+#include <vector>
+#include <cmath>
 #include <iostream>
 
 #if defined(_WIN32) || defined(__WIN32__)
@@ -12,8 +18,333 @@
 
 namespace {
 
+// Host Suites
 OfxHost* g_host = nullptr;
+OfxPropertySuiteV1* g_propSuite = nullptr;
+OfxParameterSuiteV1* g_paramSuite = nullptr;
+OfxImageEffectSuiteV1* g_effectSuite = nullptr;
 
+// Parameter Names
+constexpr const char* kParamTemporalRadius   = "temporalRadius";
+constexpr const char* kParamTemporalStrength = "temporalStrength";
+constexpr const char* kParamSpatialStrength  = "spatialStrength";
+constexpr const char* kParamDetailRecovery   = "detailRecovery";
+constexpr const char* kParamGrainAmount      = "grainAmount";
+constexpr const char* kParamPreviewMode      = "previewMode";
+
+// Action: Load
+OfxStatus action_load() {
+    if (!g_host) return kOfxStatErrFatal;
+    g_propSuite   = static_cast<OfxPropertySuiteV1*>(g_host->fetchSuite(g_host->host, kOfxPropertySuite, 1));
+    g_paramSuite  = static_cast<OfxParameterSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxParameterSuite, 1));
+    g_effectSuite = static_cast<OfxImageEffectSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxImageEffectSuite, 1));
+
+    if (!g_propSuite || !g_paramSuite || !g_effectSuite) {
+        return kOfxStatErrMissingHostFeature;
+    }
+    return kOfxStatOK;
+}
+
+// Action: Describe
+OfxStatus action_describe(OfxImageEffectHandle effect) {
+    OfxPropertySetHandle effectProps = nullptr;
+    g_effectSuite->getPropertySet(effect, &effectProps);
+
+    // Identity and Labels
+    g_propSuite->propSetString(effectProps, kOfxPropLabel, 0, "LibreNoise");
+    g_propSuite->propSetString(effectProps, kOfxPropShortLabel, 0, "LibreNoise");
+    g_propSuite->propSetString(effectProps, kOfxPropLongLabel, 0, "LibreNoise Video Denoiser");
+    g_propSuite->propSetString(effectProps, kOfxPropPluginDescription, 0,
+        "Production-grade open-source temporal and spatial video denoiser.");
+
+    // Contexts supported: Filter & General
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedContexts, 0, kOfxImageEffectContextFilter);
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedContexts, 1, kOfxImageEffectContextGeneral);
+
+    // Pixel depths
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedPixelDepths, 0, kOfxBitDepthFloat);
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedPixelDepths, 1, kOfxBitDepthShort);
+    g_propSuite->propSetString(effectProps, kOfxImageEffectPropSupportedPixelDepths, 2, kOfxBitDepthByte);
+
+    // Request temporal frame access
+    g_propSuite->propSetInt(effectProps, kOfxImageEffectPropTemporalClipAccess, 0, 1);
+
+    return kOfxStatOK;
+}
+
+// Action: DescribeInContext
+OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+    (void)inArgs;
+    // Clips: Define Output and Source
+    OfxPropertySetHandle outputProps = nullptr;
+    g_effectSuite->clipDefine(effect, kOfxImageClipOutput, &outputProps);
+    g_propSuite->propSetString(outputProps, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+    g_propSuite->propSetString(outputProps, kOfxImageEffectPropSupportedComponents, 1, kOfxImageComponentRGB);
+
+    OfxPropertySetHandle sourceProps = nullptr;
+    g_effectSuite->clipDefine(effect, kOfxImageClipSource, &sourceProps);
+    g_propSuite->propSetString(sourceProps, kOfxImageEffectPropSupportedComponents, 0, kOfxImageComponentRGBA);
+    g_propSuite->propSetString(sourceProps, kOfxImageEffectPropSupportedComponents, 1, kOfxImageComponentRGB);
+    g_propSuite->propSetInt(sourceProps, kOfxImageEffectPropTemporalClipAccess, 0, 1);
+
+    // Parameter Set
+    OfxParamSetHandle paramSet = nullptr;
+    g_effectSuite->getParamSet(effect, &paramSet);
+
+    // 1. Temporal Radius (Integer 0 to 4)
+    OfxPropertySetHandle pProps = nullptr;
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeInteger, kParamTemporalRadius, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Radius");
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 2);
+    g_propSuite->propSetInt(pProps, kOfxParamPropMin, 0, 0);
+    g_propSuite->propSetInt(pProps, kOfxParamPropMax, 0, 4);
+
+    // 2. Temporal Strength
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTemporalStrength, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Strength");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
+
+    // 3. Spatial Strength
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamSpatialStrength, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Spatial Strength");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
+
+    // 4. Detail Recovery
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamDetailRecovery, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Detail Recovery");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.15);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 1.0);
+
+    // 5. Grain Re-injection
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamGrainAmount, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Grain Amount");
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 0.5);
+
+    // 6. Preview Mode
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamPreviewMode, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Preview Mode");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Denoised Output");
+    g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 1, "Residual (Noise Only)");
+    g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 0);
+
+    return kOfxStatOK;
+}
+
+// Action: GetFramesNeeded
+OfxStatus action_get_frames_needed(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
+    double time = 0.0;
+    g_propSuite->propGetDouble(inArgs, kOfxPropTime, 0, &time);
+
+    OfxParamSetHandle paramSet = nullptr;
+    g_effectSuite->getParamSet(effect, &paramSet);
+
+    OfxParamHandle radParam = nullptr;
+    g_paramSuite->paramGetHandle(paramSet, kParamTemporalRadius, &radParam, nullptr);
+    int radius = 2;
+    if (radParam) {
+        g_paramSuite->paramGetValueAtTime(radParam, time, &radius);
+    }
+
+    OfxRangeD range;
+    range.min = time - radius;
+    range.max = time + radius;
+
+    // Declare required range for Source clip
+    OfxImageClipHandle sourceClip = nullptr;
+    g_effectSuite->clipGetHandle(effect, kOfxImageClipSource, &sourceClip, nullptr);
+    if (sourceClip) {
+        OfxPropertySetHandle clipProps = nullptr;
+        g_effectSuite->clipGetPropertySet(sourceClip, &clipProps);
+        char* clipName = nullptr;
+        g_propSuite->propGetString(clipProps, kOfxPropName, 0, &clipName);
+        if (clipName) {
+            g_propSuite->propSetDoubleN(outArgs, clipName, 2, &range.min);
+        }
+    }
+
+    return kOfxStatOK;
+}
+
+// Action: Render
+OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
+    double renderTime = 0.0;
+    g_propSuite->propGetDouble(inArgs, kOfxPropTime, 0, &renderTime);
+
+    // Read Parameters
+    OfxParamSetHandle paramSet = nullptr;
+    g_effectSuite->getParamSet(effect, &paramSet);
+
+    int radius = 2;
+    double tempStrength = 1.0;
+    double spatStrength = 1.0;
+    double detailRec = 0.15;
+    double grainAmt = 0.0;
+    int previewMode = 0;
+
+    OfxParamHandle p = nullptr;
+    if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalRadius, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &radius);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tempStrength);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamSpatialStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &spatStrength);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamDetailRecovery, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &detailRec);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamGrainAmount, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &grainAmt);
+    if (g_paramSuite->paramGetHandle(paramSet, kParamPreviewMode, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &previewMode);
+
+    // Get Output Image
+    OfxImageClipHandle outputClip = nullptr;
+    g_effectSuite->clipGetHandle(effect, kOfxImageClipOutput, &outputClip, nullptr);
+    if (!outputClip) return kOfxStatFailed;
+
+    OfxPropertySetHandle outImage = nullptr;
+    g_effectSuite->clipGetImage(outputClip, renderTime, nullptr, &outImage);
+    if (!outImage) return kOfxStatFailed;
+
+    void* outData = nullptr;
+    g_propSuite->propGetPointer(outImage, kOfxImagePropData, 0, &outData);
+    int outRowBytes = 0;
+    g_propSuite->propGetInt(outImage, kOfxImagePropRowBytes, 0, &outRowBytes);
+    int bounds[4] = {0, 0, 0, 0};
+    g_propSuite->propGetIntN(outImage, kOfxImagePropBounds, 4, bounds);
+    char* bitDepth = nullptr;
+    g_propSuite->propGetString(outImage, kOfxImageEffectPropPixelDepth, 0, &bitDepth);
+
+    int width = bounds[2] - bounds[0];
+    int height = bounds[3] - bounds[1];
+    if (width <= 0 || height <= 0 || !outData) {
+        g_effectSuite->clipReleaseImage(outImage);
+        return kOfxStatOK;
+    }
+
+    // Get Source Clip and Temporal Frames
+    OfxImageClipHandle sourceClip = nullptr;
+    g_effectSuite->clipGetHandle(effect, kOfxImageClipSource, &sourceClip, nullptr);
+    if (!sourceClip) {
+        g_effectSuite->clipReleaseImage(outImage);
+        return kOfxStatFailed;
+    }
+
+    std::vector<librenoise::VideoFrame32F> window;
+    std::vector<OfxPropertySetHandle> sourceImages;
+
+    for (int t = -radius; t <= radius; ++t) {
+        double frameTime = renderTime + t;
+        OfxPropertySetHandle srcImg = nullptr;
+        g_effectSuite->clipGetImage(sourceClip, frameTime, nullptr, &srcImg);
+        if (!srcImg) {
+            // Fallback: request at current time if boundary
+            g_effectSuite->clipGetImage(sourceClip, renderTime, nullptr, &srcImg);
+        }
+        if (srcImg) {
+            sourceImages.push_back(srcImg);
+            void* srcData = nullptr;
+            g_propSuite->propGetPointer(srcImg, kOfxImagePropData, 0, &srcData);
+            int srcRowBytes = 0;
+            g_propSuite->propGetInt(srcImg, kOfxImagePropRowBytes, 0, &srcRowBytes);
+
+            // Convert to VideoFrame32F (RGB planes)
+            librenoise::VideoFrame32F frame(width, height, 3);
+            if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
+                const auto* srcPtr = reinterpret_cast<const float*>(srcData);
+                int floatStride = srcRowBytes / sizeof(float);
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        frame.channels[0].at(x, y) = srcPtr[y * floatStride + x * 4 + 0]; // R
+                        frame.channels[1].at(x, y) = srcPtr[y * floatStride + x * 4 + 1]; // G
+                        frame.channels[2].at(x, y) = srcPtr[y * floatStride + x * 4 + 2]; // B
+                    }
+                }
+            } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
+                const auto* srcPtr = reinterpret_cast<const uint8_t*>(srcData);
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        frame.channels[0].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 0] / 255.0f;
+                        frame.channels[1].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 1] / 255.0f;
+                        frame.channels[2].at(x, y) = srcPtr[y * srcRowBytes + x * 4 + 2] / 255.0f;
+                    }
+                }
+            }
+            window.push_back(frame);
+        }
+    }
+
+    // Configure Denoiser
+    librenoise::VideoDenoiser::Config config;
+    config.temporal_radius = radius;
+    config.filter_params.patch_size = 8;
+    config.filter_params.step_size = 3;
+    config.filter_params.temporal_weight = static_cast<float>(tempStrength);
+    config.filter_params.spatial_weight = static_cast<float>(spatStrength);
+    config.detail_params.detail_recovery = static_cast<float>(detailRec);
+    config.detail_params.grain_amount = static_cast<float>(grainAmt);
+
+    librenoise::VideoDenoiser denoiser(config);
+    librenoise::VideoFrame32F denoised = denoiser.process_window(window);
+
+    // Write back to Output
+    const size_t centerIdx = window.size() / 2;
+    const auto& refFrame = window[centerIdx];
+
+    if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthFloat) == 0) {
+        auto* dstPtr = reinterpret_cast<float*>(outData);
+        int floatStride = outRowBytes / sizeof(float);
+
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float r = denoised.channels[0].at(x, y);
+                float g = denoised.channels[1].at(x, y);
+                float b = denoised.channels[2].at(x, y);
+
+                if (previewMode == 1) { // Residual mode: noise + 0.5 neutral
+                    r = (refFrame.channels[0].at(x, y) - r) * 2.0f + 0.5f;
+                    g = (refFrame.channels[1].at(x, y) - g) * 2.0f + 0.5f;
+                    b = (refFrame.channels[2].at(x, y) - b) * 2.0f + 0.5f;
+                }
+
+                dstPtr[y * floatStride + x * 4 + 0] = std::clamp(r, 0.0f, 1.0f);
+                dstPtr[y * floatStride + x * 4 + 1] = std::clamp(g, 0.0f, 1.0f);
+                dstPtr[y * floatStride + x * 4 + 2] = std::clamp(b, 0.0f, 1.0f);
+                dstPtr[y * floatStride + x * 4 + 3] = 1.0f; // Alpha
+            }
+        }
+    } else if (bitDepth && std::strcmp(bitDepth, kOfxBitDepthByte) == 0) {
+        auto* dstPtr = reinterpret_cast<uint8_t*>(outData);
+
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float r = denoised.channels[0].at(x, y);
+                float g = denoised.channels[1].at(x, y);
+                float b = denoised.channels[2].at(x, y);
+
+                if (previewMode == 1) {
+                    r = (refFrame.channels[0].at(x, y) - r) * 2.0f + 0.5f;
+                    g = (refFrame.channels[1].at(x, y) - g) * 2.0f + 0.5f;
+                    b = (refFrame.channels[2].at(x, y) - b) * 2.0f + 0.5f;
+                }
+
+                dstPtr[y * outRowBytes + x * 4 + 0] = static_cast<uint8_t>(std::clamp(r * 255.0f, 0.0f, 255.0f));
+                dstPtr[y * outRowBytes + x * 4 + 1] = static_cast<uint8_t>(std::clamp(g * 255.0f, 0.0f, 255.0f));
+                dstPtr[y * outRowBytes + x * 4 + 2] = static_cast<uint8_t>(std::clamp(b * 255.0f, 0.0f, 255.0f));
+                dstPtr[y * outRowBytes + x * 4 + 3] = 255;
+            }
+        }
+    }
+
+    // Cleanup images
+    for (auto img : sourceImages) {
+        g_effectSuite->clipReleaseImage(img);
+    }
+    g_effectSuite->clipReleaseImage(outImage);
+
+    return kOfxStatOK;
+}
+
+// Primary Plugin Entry Point
 OfxStatus plugin_main_entry(
     const char* action,
     const void* handle,
@@ -21,31 +352,26 @@ OfxStatus plugin_main_entry(
     OfxPropertySetHandle outArgs
 ) {
     if (std::strcmp(action, kOfxActionLoad) == 0) {
-        return kOfxStatOK;
+        return action_load();
     }
-    
     if (std::strcmp(action, kOfxActionUnload) == 0) {
         return kOfxStatOK;
     }
-
     if (std::strcmp(action, kOfxActionDescribe) == 0) {
-        // Plugin descriptor logic
-        return kOfxStatOK;
+        auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
+        return action_describe(effect);
     }
-
     if (std::strcmp(action, kOfxImageEffectActionDescribeInContext) == 0) {
-        // Declare RGBA & Float bitdepth support, temporal frame access
-        return kOfxStatOK;
+        auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
+        return action_describe_in_context(effect, inArgs);
     }
-
     if (std::strcmp(action, kOfxImageEffectActionGetFramesNeeded) == 0) {
-        // Temporal frame fetching: request t-2 to t+2 (radius = 2)
-        return kOfxStatOK;
+        auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
+        return action_get_frames_needed(effect, inArgs, outArgs);
     }
-
     if (std::strcmp(action, kOfxImageEffectActionRender) == 0) {
-        // Connect host buffer pointers to librenoise::VideoFrame32F and execute
-        return kOfxStatOK;
+        auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(handle));
+        return action_render(effect, inArgs);
     }
 
     return kOfxStatOK;

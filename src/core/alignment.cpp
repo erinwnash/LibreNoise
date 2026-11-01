@@ -51,6 +51,7 @@ MotionField MotionEstimator::estimate(
     // Multiplier for exposure drift compensation
     const float gain_correction = (exposure_drift_ratio > 0.01f) ? (1.0f / exposure_drift_ratio) : 1.0f;
 
+    #pragma omp parallel for schedule(dynamic)
     for (int32_t by = 0; by < num_by; ++by) {
         for (int32_t bx = 0; bx < num_bx; ++bx) {
             const int32_t ref_x = bx * bs;
@@ -60,7 +61,7 @@ MotionField MotionEstimator::estimate(
             int32_t best_dy = 0;
             float min_sad = 1e9f;
 
-            // Hierarchical / diamond search within search_radius
+            // Coarse search within search_radius
             const int32_t rad = params.search_radius;
             const int32_t min_x = std::max(0, ref_x - rad);
             const int32_t max_x = std::min(w - bs, ref_x + rad);
@@ -85,7 +86,7 @@ MotionField MotionEstimator::estimate(
                 }
             }
 
-            // Local fine search around best step
+            // Fine search around best point
             const int32_t fine_min_x = std::max(0, ref_x + best_dx - 1);
             const int32_t fine_max_x = std::min(w - bs, ref_x + best_dx + 1);
             const int32_t fine_min_y = std::max(0, ref_y + best_dy - 1);
@@ -112,7 +113,6 @@ MotionField MotionEstimator::estimate(
             // Mean squared error per pixel
             float mse = (min_sad / static_cast<float>(bs * bs));
             
-            // Average intensity in block
             float avg_intensity = ref_luma.at(ref_x + bs / 2, ref_y + bs / 2);
             float expected_noise_variance = nlf.variance_at(avg_intensity);
             float trust_threshold = params.trust_sigma_multiplier * std::sqrt(expected_noise_variance);

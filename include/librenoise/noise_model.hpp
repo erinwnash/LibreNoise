@@ -27,11 +27,12 @@ struct NoiseLevelFunction {
 
 /**
  * @brief Frequency and channel-resolved noise power spectrum density (PSD).
- * Decomposes noise into 4 spatial frequency octaves (Low, Mid-Low, Mid-High, High)
- * across 3 decorrelated channels (Y, Cb, Cr).
+ * Decomposes noise into 5 spatial frequency bands:
+ *   [0] Very Low, [1] Low, [2] Mid, [3] High, [4] Very High
+ * across 3 decorrelated channels: [0] Y, [1] Cb, [2] Cr.
  */
 struct NoisePsd {
-    static constexpr size_t NUM_OCTAVES = 4;
+    static constexpr size_t NUM_OCTAVES = 5;
     static constexpr size_t NUM_CHANNELS = 3;
 
     // sigma_scale[channel][octave] relative to base sigma
@@ -58,6 +59,7 @@ struct NoiseProfile {
     std::array<NoiseLevelFunction, 3> nlf_per_channel; // Y, Cb, Cr
     NoisePsd psd;
     bool has_fixed_pattern = false;
+    bool remove_compression_artifacts = true; // Separate processing for compression/blocking artifacts
     ImagePlane32F fixed_pattern_map;
 
     NoiseProfile() = default;

@@ -3,6 +3,10 @@
 #include <vector>
 #include <algorithm>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace librenoise {
 
 namespace {
@@ -117,6 +121,7 @@ void CollaborativePatchFilter3D::process_plane(
     const int32_t h = output_plane.height();
     const int32_t ps = params_.patch_size; // 8
     const int32_t step = params_.step_size; // e.g. 3 or 4
+    const size_t total_pixels = static_cast<size_t>(w * h);
 
     ImagePlane32F numerator(w, h);
     ImagePlane32F denominator(w, h);
@@ -125,139 +130,156 @@ void CollaborativePatchFilter3D::process_plane(
 
     const ImagePlane32F* ref_plane = temporal_planes[ref_index];
 
-    // Slide reference patch across frame
-    for (int32_t y = 0; y <= h - ps; y += step) {
-        for (int32_t x = 0; x <= w - ps; x += step) {
-            float ref_patch[64];
-            for (int32_t py = 0; py < ps; ++py) {
-                for (int32_t px = 0; px < ps; ++px) {
-                    ref_patch[py * 8 + px] = ref_plane->at(x + px, y + py);
-                }
-            }
+    #pragma omp parallel
+    {
+        ImagePlane32F local_num(w, h);
+        ImagePlane32F local_den(w, h);
+        local_num.fill(0.0f);
+        local_den.fill(0.0f);
 
-            // Estimate local noise sigma
-            float center_intensity = ref_patch[27];
-            float sigma = nlf.sigma_at(center_intensity);
-            float hard_threshold = params_.hard_thresh_lambda * sigma;
-
-            // Grouping: reference patch is always group[0]
-            struct GroupMember {
-                size_t frame_idx;
-                int32_t patch_x;
-                int32_t patch_y;
-                float patch[64];
-            };
-            std::vector<GroupMember> group;
-            group.reserve(temporal_planes.size());
-
-            GroupMember ref_member{ref_index, x, y, {}};
-            std::copy(ref_patch, ref_patch + 64, ref_member.patch);
-            group.push_back(ref_member);
-
-            // Group matching across temporal neighbors
-            for (size_t f = 0; f < temporal_planes.size(); ++f) {
-                if (f == ref_index) continue;
-
-                const auto* mf = motion_fields[f];
-                int32_t disp_x = 0;
-                int32_t disp_y = 0;
-                bool trusted = true;
-
-                if (mf) {
-                    auto mv = mf->get_vector_at_pixel(x + ps / 2, y + ps / 2);
-                    disp_x = mv.dx;
-                    disp_y = mv.dy;
-                    trusted = mv.trusted;
-                }
-
-                if (!trusted) continue;
-
-                int32_t cand_x = std::clamp(x + disp_x, 0, w - ps);
-                int32_t cand_y = std::clamp(y + disp_y, 0, h - ps);
-
-                GroupMember cand_member{f, cand_x, cand_y, {}};
+        #pragma omp for schedule(dynamic)
+        for (int32_t y = 0; y <= h - ps; y += step) {
+            for (int32_t x = 0; x <= w - ps; x += step) {
+                float ref_patch[64];
                 for (int32_t py = 0; py < ps; ++py) {
                     for (int32_t px = 0; px < ps; ++px) {
-                        cand_member.patch[py * 8 + px] = temporal_planes[f]->at(cand_x + px, cand_y + py);
+                        ref_patch[py * 8 + px] = ref_plane->at(x + px, y + py);
                     }
                 }
 
-                // Check distance
-                float dist = 0.0f;
-                for (int32_t i = 0; i < 64; ++i) {
-                    float diff = ref_patch[i] - cand_member.patch[i];
-                    dist += diff * diff;
+                // Estimate local noise sigma
+                float center_intensity = ref_patch[27];
+                float sigma = nlf.sigma_at(center_intensity);
+                float hard_threshold = params_.hard_thresh_lambda * sigma;
+
+                struct GroupMember {
+                    size_t frame_idx;
+                    int32_t patch_x;
+                    int32_t patch_y;
+                    float patch[64];
+                };
+                std::vector<GroupMember> group;
+                group.reserve(temporal_planes.size());
+
+                GroupMember ref_member{ref_index, x, y, {}};
+                std::copy(ref_patch, ref_patch + 64, ref_member.patch);
+                group.push_back(ref_member);
+
+                // Group matching across temporal neighbors
+                for (size_t f = 0; f < temporal_planes.size(); ++f) {
+                    if (f == ref_index) continue;
+
+                    const auto* mf = motion_fields[f];
+                    int32_t disp_x = 0;
+                    int32_t disp_y = 0;
+                    bool trusted = true;
+
+                    if (mf) {
+                        auto mv = mf->get_vector_at_pixel(x + ps / 2, y + ps / 2);
+                        disp_x = mv.dx;
+                        disp_y = mv.dy;
+                        trusted = mv.trusted;
+                    }
+
+                    if (!trusted) continue;
+
+                    int32_t cand_x = std::clamp(x + disp_x, 0, w - ps);
+                    int32_t cand_y = std::clamp(y + disp_y, 0, h - ps);
+
+                    GroupMember cand_member{f, cand_x, cand_y, {}};
+                    for (int32_t py = 0; py < ps; ++py) {
+                        for (int32_t px = 0; px < ps; ++px) {
+                            cand_member.patch[py * 8 + px] = temporal_planes[f]->at(cand_x + px, cand_y + py);
+                        }
+                    }
+
+                    float dist = 0.0f;
+                    for (int32_t i = 0; i < 64; ++i) {
+                        float diff = ref_patch[i] - cand_member.patch[i];
+                        dist += diff * diff;
+                    }
+                    dist /= 64.0f;
+
+                    if (dist <= 4.0f * (sigma * sigma + 1e-6f)) {
+                        group.push_back(cand_member);
+                        if (group.size() >= static_cast<size_t>(params_.max_group_size)) break;
+                    }
                 }
-                dist /= 64.0f;
 
-                // Residual trust threshold: allow up to 4 * sigma^2
-                if (dist <= 4.0f * (sigma * sigma + 1e-6f)) {
-                    group.push_back(cand_member);
-                    if (group.size() >= static_cast<size_t>(params_.max_group_size)) break;
+                int K = static_cast<int>(group.size());
+
+                // 1. Spatial 2D DCT
+                std::vector<std::array<float, 64>> spatial_coeffs(K);
+                for (int k = 0; k < K; ++k) {
+                    dct8x8_2d(group[k].patch, spatial_coeffs[k].data());
                 }
-            }
 
-            int K = static_cast<int>(group.size());
-
-            // 1. Spatial 2D DCT for each patch in group
-            std::vector<std::array<float, 64>> spatial_coeffs(K);
-            for (int k = 0; k < K; ++k) {
-                dct8x8_2d(group[k].patch, spatial_coeffs[k].data());
-            }
-
-            // 2. Temporal 1D DCT along group axis K
-            std::vector<std::array<float, 64>> transform_3d(K);
-            for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                float temp_in[16];
-                float temp_out[16];
-                for (int k = 0; k < K; ++k) temp_in[k] = spatial_coeffs[k][coeff_idx];
-                temporal_dct_forward(temp_in, temp_out, K);
-                for (int k = 0; k < K; ++k) transform_3d[k][coeff_idx] = temp_out[k];
-            }
-
-            // 3. Collaborative Hard Thresholding (Pass 1)
-            int non_zero_count = 0;
-            for (int k = 0; k < K; ++k) {
+                // 2. Temporal 1D DCT
+                std::vector<std::array<float, 64>> transform_3d(K);
                 for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    // Do not threshold the global DC coefficient
-                    if (k == 0 && coeff_idx == 0) {
-                        non_zero_count++;
-                        continue;
+                    float temp_in[16];
+                    float temp_out[16];
+                    for (int k = 0; k < K; ++k) temp_in[k] = spatial_coeffs[k][coeff_idx];
+                    temporal_dct_forward(temp_in, temp_out, K);
+                    for (int k = 0; k < K; ++k) transform_3d[k][coeff_idx] = temp_out[k];
+                }
+
+                // 3. Collaborative Hard Thresholding
+                int non_zero_count = 0;
+                for (int k = 0; k < K; ++k) {
+                    for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
+                        if (k == 0 && coeff_idx == 0) {
+                            non_zero_count++;
+                            continue;
+                        }
+                        float val = transform_3d[k][coeff_idx];
+                        if (std::abs(val) < hard_threshold) {
+                            transform_3d[k][coeff_idx] = 0.0f;
+                        } else {
+                            non_zero_count++;
+                        }
                     }
-                    float val = transform_3d[k][coeff_idx];
-                    if (std::abs(val) < hard_threshold) {
-                        transform_3d[k][coeff_idx] = 0.0f;
-                    } else {
-                        non_zero_count++;
+                }
+
+                // 4. Inverse Temporal 1D DCT
+                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
+                    float temp_in[16];
+                    float temp_out[16];
+                    for (int k = 0; k < K; ++k) temp_in[k] = transform_3d[k][coeff_idx];
+                    temporal_dct_inverse(temp_in, temp_out, K);
+                    for (int k = 0; k < K; ++k) spatial_coeffs[k][coeff_idx] = temp_out[k];
+                }
+
+                // 5. Inverse Spatial 2D IDCT
+                float filtered_ref_patch[64];
+                idct8x8_2d(spatial_coeffs[0].data(), filtered_ref_patch);
+
+                // 6. Thread-local aggregation
+                float weight = 1.0f / (static_cast<float>(std::max(1, non_zero_count)));
+                for (int32_t py = 0; py < ps; ++py) {
+                    for (int32_t px = 0; px < ps; ++px) {
+                        local_num.at(x + px, y + py) += filtered_ref_patch[py * 8 + px] * weight;
+                        local_den.at(x + px, y + py) += weight;
                     }
                 }
             }
+        }
 
-            // 4. Inverse Temporal 1D DCT
-            for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                float temp_in[16];
-                float temp_out[16];
-                for (int k = 0; k < K; ++k) temp_in[k] = transform_3d[k][coeff_idx];
-                temporal_dct_inverse(temp_in, temp_out, K);
-                for (int k = 0; k < K; ++k) spatial_coeffs[k][coeff_idx] = temp_out[k];
-            }
+        #pragma omp critical
+        {
+            float* num_ptr = numerator.data();
+            float* den_ptr = denominator.data();
+            const float* lnum_ptr = local_num.data();
+            const float* lden_ptr = local_den.data();
 
-            // 5. Inverse Spatial 2D IDCT of Reference Patch (k = 0)
-            float filtered_ref_patch[64];
-            idct8x8_2d(spatial_coeffs[0].data(), filtered_ref_patch);
-
-            // 6. Aggregation
-            float weight = 1.0f / (static_cast<float>(std::max(1, non_zero_count)));
-            for (int32_t py = 0; py < ps; ++py) {
-                for (int32_t px = 0; px < ps; ++px) {
-                    numerator.at(x + px, y + py) += filtered_ref_patch[py * 8 + px] * weight;
-                    denominator.at(x + px, y + py) += weight;
-                }
+            for (size_t i = 0; i < total_pixels; ++i) {
+                num_ptr[i] += lnum_ptr[i];
+                den_ptr[i] += lden_ptr[i];
             }
         }
     }
 
-    // Canvas normalization
+    // Normalize output plane
     for (int32_t y = 0; y < h; ++y) {
         for (int32_t x = 0; x < w; ++x) {
             float d = denominator.at(x, y);

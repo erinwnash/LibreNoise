@@ -25,6 +25,7 @@ extern "C" {
 #define kOfxStatErrFatal 2
 #define kOfxStatErrMemory 3
 #define kOfxStatErrUnsupported 4
+#define kOfxStatErrMissingHostFeature 5
 
 typedef int OfxStatus;
 typedef struct OfxPropertySetStruct* OfxPropertySetHandle;
@@ -32,7 +33,11 @@ typedef struct OfxImageEffectStruct* OfxImageEffectHandle;
 typedef struct OfxClipStruct* OfxImageClipHandle;
 typedef struct OfxParamStruct* OfxParamHandle;
 typedef struct OfxParamSetStruct* OfxParamSetHandle;
-typedef void* OfxHost;
+
+typedef struct OfxHost {
+    OfxPropertySetHandle host;
+    void* (*fetchSuite)(OfxPropertySetHandle host, const char* suiteName, int suiteVersion);
+} OfxHost;
 
 typedef OfxStatus (*OfxPluginEntryPoint)(
     const char* action,
@@ -50,11 +55,6 @@ typedef struct OfxPlugin {
     void (*setHost)(OfxHost* host);
     OfxPluginEntryPoint mainEntry;
 } OfxPlugin;
-
-typedef struct OfxHostStruct {
-    OfxPropertySetHandle host;
-    void* (*fetchSuite)(OfxPropertySetHandle host, const char* suiteName, int suiteVersion);
-} OfxHostStruct;
 
 #ifdef __cplusplus
 }

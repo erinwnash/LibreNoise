@@ -8,7 +8,7 @@ namespace librenoise {
 struct DetailParams {
     float detail_recovery = 0.15f; // Edge-protected micro-contrast recovery [0.0, 1.0]
     float grain_amount = 0.05f; // Calibrated synthetic grain re-injection [0.0, 1.0]
-    uint32_t grain_seed = 1337; // Random seed for grain generation (host should add the frame number so grain is not a fixed pattern) (host should add the frame number so grain is not a fixed pattern)
+    uint32_t grain_seed = 1337; // Random seed for grain generation
 };
 
 class DetailEngine {
@@ -32,8 +32,7 @@ public:
         ImagePlane32F& plane,
         const NoiseLevelFunction& nlf,
         float grain_amount,
-        uint32_t seed,
-        const ImagePlane32F* guide = nullptr // Luma plane used to evaluate the NLF for chroma planes
+        uint32_t seed
     );
 
     /**

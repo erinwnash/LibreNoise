@@ -1,5 +1,4 @@
 #include "librenoise/roi_analyzer.hpp"
-#include "librenoise/colorspace.hpp"
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -174,8 +173,7 @@ AnalysisRoi NoiseRoiAnalyzer::find_optimal_roi(
 
     const int32_t img_w = frame.width;
     const int32_t img_h = frame.height;
-    const VideoFrame32F luma_frame = (frame.channel_count() >= 3) ? colorspace::to_ycc(frame) : frame;
-    const auto& y_plane = luma_frame.channels[0];
+    const auto& y_plane = frame.channels[0];
 
     int32_t box_w = std::min(preferred_size, img_w - 4);
     int32_t box_h = std::min(preferred_size, img_h - 4);
@@ -238,12 +236,10 @@ AnalysisRoi NoiseRoiAnalyzer::find_optimal_roi(
 }
 
 RoiAnalysisResult NoiseRoiAnalyzer::analyze_roi(
-    const VideoFrame32F& frame_rgb,
+    const VideoFrame32F& frame,
     const AnalysisRoi& roi
 ) {
     RoiAnalysisResult result;
-    // Measure in the Y/Cb/Cr working space used by the denoise engines.
-    const VideoFrame32F frame = (frame_rgb.channel_count() >= 3) ? colorspace::to_ycc(frame_rgb) : frame_rgb;
     result.roi = roi;
 
     if (!frame.is_valid() || !roi.is_valid(frame.width, frame.height)) {
@@ -318,26 +314,24 @@ RoiAnalysisResult NoiseRoiAnalyzer::analyze_roi(
 
     // Fit heteroscedastic model per channel: sigma^2(I) = a * I + b
     float var_y = result.sigma_y * result.sigma_y;
-    // All three channels look their noise level up against LUMA intensity.
     result.nlf_y.a = var_y * 0.5f / std::max(0.05f, mean_y);
     result.nlf_y.b = var_y * 0.5f;
 
     float var_cb = result.sigma_cb * result.sigma_cb;
-    (void)mean_cb; (void)mean_cr;
-    result.nlf_cb.a = var_cb * 0.5f / std::max(0.05f, mean_y);
+    result.nlf_cb.a = var_cb * 0.5f / std::max(0.05f, mean_cb);
     result.nlf_cb.b = var_cb * 0.5f;
 
     float var_cr = result.sigma_cr * result.sigma_cr;
-    result.nlf_cr.a = var_cr * 0.5f / std::max(0.05f, mean_y);
+    result.nlf_cr.a = var_cr * 0.5f / std::max(0.05f, mean_cr);
     result.nlf_cr.b = var_cr * 0.5f;
 
-    // Measure the 5-band 2D DCT noise spectrum of each channel independently (sigma_scale relative to
-    // that channel's own mean AC amplitude). Chroma noise is typically far lower-frequency than luma.
+    // Measure 5-band 2D DCT frequency spectrum across 8x8 blocks (sigma_scale relative to base sigma)
+    std::array<double, 5> band_energy{0.0, 0.0, 0.0, 0.0, 0.0};
+    std::array<int64_t, 5> band_counts{0, 0, 0, 0, 0};
+    double total_ac_energy = 0.0;
+    int64_t total_ac_bins = 0;
+
     for (int ch = 0; ch < 3; ++ch) {
-        std::array<double, 5> band_energy{0.0, 0.0, 0.0, 0.0, 0.0};
-        std::array<int64_t, 5> band_counts{0, 0, 0, 0, 0};
-        double total_ac_energy = 0.0;
-        int64_t total_ac_bins = 0;
         const auto& pl = *planes[ch];
         for (int by = roi.y; by <= roi.y + roi.height - 8; by += 8) {
             for (int bx = roi.x; bx <= roi.x + roi.width - 8; bx += 8) {
@@ -390,18 +384,17 @@ RoiAnalysisResult NoiseRoiAnalyzer::analyze_roi(
                 }
             }
         }
+    }
 
-        if (total_ac_bins > 0 && total_ac_energy > 1e-14) {
-            double mean_ac_pwr = total_ac_energy / static_cast<double>(total_ac_bins);
-            for (int i = 0; i < 5; ++i) {
-                double band_mean = (band_counts[i] > 0) ? (band_energy[i] / static_cast<double>(band_counts[i])) : mean_ac_pwr;
-                float sigma_scale = static_cast<float>(std::sqrt(std::max(0.0, band_mean / mean_ac_pwr)));
-                // Wide clamp: strongly correlated (blurred / compressed) noise has a very uneven spectrum
-                result.measured_psd_ch[static_cast<size_t>(ch)][static_cast<size_t>(i)] = std::clamp(sigma_scale, 0.3f, 4.0f);
-            }
+    if (total_ac_bins > 0 && total_ac_energy > 1e-14) {
+        double mean_ac_pwr = total_ac_energy / static_cast<double>(total_ac_bins);
+        for (int i = 0; i < 5; ++i) {
+            double band_mean = (band_counts[i] > 0) ? (band_energy[i] / static_cast<double>(band_counts[i])) : mean_ac_pwr;
+            float sigma_scale = static_cast<float>(std::sqrt(std::max(0.0, band_mean / mean_ac_pwr)));
+            result.measured_psd[i] = std::clamp(sigma_scale, 0.65f, 3.0f);
         }
     }
-    result.measured_psd = result.measured_psd_ch[0];
+
     // Uniformity and quality score (normalized for both scene-linear and display-referred plates)
     float grad = evaluate_patch_gradient(y_plane, roi.x, roi.y, roi.width, roi.height);
     float mean_span = 0.0f, disparity = 0.0f, clipped_frac = 0.0f;

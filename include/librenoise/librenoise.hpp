@@ -10,7 +10,6 @@
 #include "alignment.hpp"
 #include "filter.hpp"
 #include "detail.hpp"
-#include "colorspace.hpp"
 
 namespace librenoise {
 
@@ -24,7 +23,6 @@ public:
         MotionEstimator::MatchParams match_params{};
         DetailParams detail_params{};
         int32_t temporal_radius = 2; // Radius 2 -> 5 frames total
-        int32_t reference_index = -1; // Index of the frame being denoised inside the window (-1 = centre)
     };
 
     explicit VideoDenoiser(const Config& config = Config{}) : config_(config) {}
@@ -37,18 +35,6 @@ public:
      */
     VideoFrame32F process_window(
         const std::vector<VideoFrame32F>& temporal_window,
-        const NoiseProfile* profile = nullptr
-    );
-
-    /**
-     * @brief Same as process_window() but converts 	emporal_window to the Y/Cb/Cr working space in
-     * place instead of copying it (saves RAM on large frames). The frames are converted back to
-     * RGB before returning, so the caller's data is restored (to within float round-off).
-     *
-     * Frames are expected as RGB. The returned frame is RGB. Noise profiles are in the Y/Cb/Cr domain.
-     */
-    VideoFrame32F process_window_inplace(
-        std::vector<VideoFrame32F>& temporal_window,
         const NoiseProfile* profile = nullptr
     );
 

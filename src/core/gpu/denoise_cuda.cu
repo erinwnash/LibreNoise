@@ -1627,15 +1627,12 @@ bool cuda_denoise_device(
         cfg.band_weights[b] = params.band_weights[b];
         cfg.tonal_lut[b] = params.tonal_lut[b];
         for (int c = 0; c < 3; ++c) {
-            cfg.psd_weights[c][b] = params.psd_weights[0][b]; // spectral shape measured on luma, shared by R/G/B
+            cfg.psd_weights[c][b] = params.psd_weights[c][b];
         }
     }
-    {
-        // Callers supply the profile in the Y/Cb/Cr working space; the GPU kernels filter RGB directly.
-        std::array<NoiseLevelFunction, 3> ycc{};
-        for (int c = 0; c < 3; ++c) { ycc[static_cast<size_t>(c)].a = params.nlf_a[c]; ycc[static_cast<size_t>(c)].b = params.nlf_b[c]; }
-        const auto rgb = colorspace::ycc_nlf_to_rgb(ycc);
-        for (int c = 0; c < 3; ++c) { cfg.nlf_a[c] = rgb[static_cast<size_t>(c)].a; cfg.nlf_b[c] = rgb[static_cast<size_t>(c)].b; }
+    for (int c = 0; c < 3; ++c) {
+        cfg.nlf_a[c] = params.nlf_a[c];
+        cfg.nlf_b[c] = params.nlf_b[c];
     }
 
     dim3 block_2d(16, 16);

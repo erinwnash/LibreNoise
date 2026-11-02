@@ -31,6 +31,7 @@ struct CudaDenoiseParams {
     float chroma_scale_cb = 1.0f;
     float chroma_scale_cr = 1.0f;
     int32_t preview_mode = 0; // 0 = denoised, 1 = residual
+    int32_t force_opaque_alpha = 0; // If 1, sets alpha channel to 1.0f (opaque)
 };
 
 /**

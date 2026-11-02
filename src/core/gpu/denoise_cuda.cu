@@ -53,6 +53,7 @@ struct GpuKernelConfig {
     float chroma_scale_cb;
     float chroma_scale_cr;
     int preview_mode;
+    int force_opaque_alpha;
     float band_weights[5];
     float psd_weights[3][5];
     float tonal_lut[5];
@@ -1524,7 +1525,8 @@ __global__ void k_postprocess_finalize(
     }
 
     if (cfg.channels >= 4) {
-        d_output[pixel_idx + 3] = d_ref_frame[pixel_idx + 3];
+        float alpha = (cfg.force_opaque_alpha != 0) ? 1.0f : d_ref_frame[pixel_idx + 3];
+        d_output[pixel_idx + 3] = alpha;
     }
 }
 
@@ -1592,6 +1594,7 @@ bool cuda_denoise_device(
     cfg.chroma_scale_cb = params.chroma_scale_cb;
     cfg.chroma_scale_cr = params.chroma_scale_cr;
     cfg.preview_mode = params.preview_mode;
+    cfg.force_opaque_alpha = params.force_opaque_alpha;
     for (int b = 0; b < 5; ++b) {
         cfg.band_weights[b] = params.band_weights[b];
         cfg.tonal_lut[b] = params.tonal_lut[b];

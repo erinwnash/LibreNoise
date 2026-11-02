@@ -42,6 +42,7 @@ OfxHost* g_host = nullptr;
 const OfxPropertySuiteV1* g_propSuite = nullptr;
 const OfxParameterSuiteV1* g_paramSuite = nullptr;
 const OfxImageEffectSuiteV1* g_effectSuite = nullptr;
+const OfxInteractSuiteV1* g_interactSuite = nullptr;
 
 namespace {
 
@@ -146,7 +147,7 @@ inline int compute_polite_cpu_threads() noexcept {
 
 inline bool is_ofx_aborted(OfxImageEffectHandle effect) noexcept {
     return (effect != nullptr && g_effectSuite != nullptr &&
-            g_effectSuite->abort != nullptr && g_effectSuite->abort(effect) != 0);
+            g_effectSuite->abort != nullptr && g_effectSuite->abort(effect) == 1);
 }
 
 bool ofx_abort_trampoline(void* user_data) {
@@ -156,9 +157,10 @@ bool ofx_abort_trampoline(void* user_data) {
 // Action: Load
 OfxStatus action_load() {
     if (!g_host || !g_host->host || !g_host->fetchSuite) return kOfxStatErrFatal;
-    g_propSuite   = static_cast<const OfxPropertySuiteV1*>(g_host->fetchSuite(g_host->host, kOfxPropertySuite, 1));
-    g_paramSuite  = static_cast<const OfxParameterSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxParameterSuite, 1));
-    g_effectSuite = static_cast<const OfxImageEffectSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxImageEffectSuite, 1));
+    g_propSuite     = static_cast<const OfxPropertySuiteV1*>(g_host->fetchSuite(g_host->host, kOfxPropertySuite, 1));
+    g_paramSuite    = static_cast<const OfxParameterSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxParameterSuite, 1));
+    g_effectSuite   = static_cast<const OfxImageEffectSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxImageEffectSuite, 1));
+    g_interactSuite = static_cast<const OfxInteractSuiteV1*>(g_host->fetchSuite(g_host->host, kOfxInteractSuite, 1));
 
     if (!g_propSuite || !g_paramSuite || !g_effectSuite) {
         return kOfxStatErrMissingHostFeature;
@@ -729,11 +731,18 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
             auto roi = librenoise::NoiseRoiAnalyzer::find_optimal_roi(frame);
 
             OfxParamHandle boxP1 = nullptr, boxP2 = nullptr;
+            double bx1 = static_cast<double>(optFrame->origin_x + roi.x);
+            double by1 = static_cast<double>(optFrame->origin_y + roi.y);
+            double bx2 = static_cast<double>(optFrame->origin_x + roi.x + roi.width);
+            double by2 = static_cast<double>(optFrame->origin_y + roi.y + roi.height);
+
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner1, &boxP1, nullptr) == kOfxStatOK && boxP1) {
-                g_paramSuite->paramSetValue(boxP1, static_cast<double>(optFrame->origin_x + roi.x), static_cast<double>(optFrame->origin_y + roi.y));
+                g_paramSuite->paramSetValue(boxP1, bx1, by1);
+                g_paramSuite->paramSetValueAtTime(boxP1, changeTime, bx1, by1);
             }
             if (g_paramSuite->paramGetHandle(paramSet, kParamAnalysisBoxCorner2, &boxP2, nullptr) == kOfxStatOK && boxP2) {
-                g_paramSuite->paramSetValue(boxP2, static_cast<double>(optFrame->origin_x + roi.x + roi.width), static_cast<double>(optFrame->origin_y + roi.y + roi.height));
+                g_paramSuite->paramSetValue(boxP2, bx2, by2);
+                g_paramSuite->paramSetValueAtTime(boxP2, changeTime, bx2, by2);
             }
 
             if (std::strcmp(paramName, kParamAutoProfile) == 0) {
@@ -1096,12 +1105,31 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         g_effectSuite->clipReleaseImage(outImage);
     };
 
-    if (sourceImages.empty() || is_ofx_aborted(effect)) {
+    if (sourceImages.empty()) {
         release_all_clips();
         return kOfxStatOK;
     }
 
     const int cpuThreads = compute_polite_cpu_threads();
+    const size_t refIdx = srcInfos.size() / 2;
+    const OfxImgInfo& refSrcInfo = srcInfos[refIdx];
+
+    // Detect if source has active alpha or is an RGB / DPX plate without alpha (all 0.0)
+    bool sourceHasAlpha = false;
+    if (refSrcInfo.channels >= 4) {
+        int stepY = std::max(1, height / 8);
+        int stepX = std::max(1, width / 8);
+        for (int py = 0; py < height; py += stepY) {
+            for (int px = 0; px < width; px += stepX) {
+                if (sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + px, outInfo.bounds[1] + py) > 0.001f) {
+                    sourceHasAlpha = true;
+                    break;
+                }
+            }
+            if (sourceHasAlpha) break;
+        }
+    }
+
     bool canUseCuda = (accelMode != 2 && librenoise::is_cuda_available());
 
     // =========================================================================
@@ -1189,6 +1217,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         cp.chroma_scale_cr = static_cast<float>(chromaCr);
         cp.chroma_scale_cb = static_cast<float>(chromaCb);
         cp.preview_mode = previewMode;
+        cp.force_opaque_alpha = sourceHasAlpha ? 0 : 1;
 
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
         // Path B1: Host passed native CUDA device pointers (Zero-copy GPU render)
@@ -1253,8 +1282,9 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 
             for (size_t i = 0; i < srcInfos.size(); ++i) {
                 const OfxImgInfo& si = srcInfos[i];
-                // Fast direct copy if already contiguous positive-rowBytes RGBA32F with identical bounds
-                bool isExactRgba32F = (si.bitDepth && std::strcmp(si.bitDepth, kOfxBitDepthFloat) == 0 &&
+                // Fast direct copy if already contiguous positive-rowBytes RGBA32F with identical bounds and active alpha
+                bool isExactRgba32F = (sourceHasAlpha &&
+                                       si.bitDepth && std::strcmp(si.bitDepth, kOfxBitDepthFloat) == 0 &&
                                        si.channels == 4 && si.rowBytes == width * 4 * static_cast<int>(sizeof(float)) &&
                                        si.bounds[0] == outInfo.bounds[0] && si.bounds[1] == outInfo.bounds[1] &&
                                        si.bounds[2] == outInfo.bounds[2] && si.bounds[3] == outInfo.bounds[3]);
@@ -1273,6 +1303,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                         float* dst_row = h_stage.data() + static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
                         for (int x = 0; x < width; ++x) {
                             sample_ofx_pixel_rgba(si, outInfo.bounds[0] + x, wy, dst_row + x * 4);
+                            if (!sourceHasAlpha) dst_row[x * 4 + 3] = 1.0f;
                         }
                     }
                     cudaMemcpy(d_alloc_ptrs[i], h_stage.data(), packedBytes, cudaMemcpyHostToDevice);
@@ -1299,8 +1330,10 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                 }
 
                 if (ok) {
-                    bool outExactRgba32F = (outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0 &&
+                    bool outExactRgba32F = (sourceHasAlpha &&
+                                            outInfo.bitDepth && std::strcmp(outInfo.bitDepth, kOfxBitDepthFloat) == 0 &&
                                             outInfo.channels == 4 &&
+                                            outInfo.bounds[0] == 0 && outInfo.bounds[1] == 0 &&
                                             outInfo.rowBytes == width * 4 * static_cast<int>(sizeof(float)));
                     if (outExactRgba32F) {
                         cudaMemcpy(outInfo.data, d_out_buf, packedBytes, cudaMemcpyDeviceToHost);
@@ -1319,7 +1352,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                                         dst_row[x * outCh + 0] = src_row[x * 4 + 0];
                                         dst_row[x * outCh + 1] = src_row[x * 4 + 1];
                                         dst_row[x * outCh + 2] = src_row[x * 4 + 2];
-                                        if (outCh >= 4) dst_row[x * outCh + 3] = src_row[x * 4 + 3];
+                                        if (outCh >= 4) dst_row[x * outCh + 3] = sourceHasAlpha ? src_row[x * 4 + 3] : 1.0f;
                                     } else if (outCh == 1) {
                                         dst_row[x] = src_row[x * 4 + 0];
                                     }
@@ -1374,17 +1407,16 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     ScopedCpuRenderLock cpuGate(g_cpuRenderLock);
     if (is_ofx_aborted(effect)) {
         release_all_clips();
-        return kOfxStatOK;
+        return kOfxStatFailed;
     }
 
     std::vector<librenoise::VideoFrame32F> frameWindow;
     frameWindow.reserve(srcInfos.size());
-    size_t refIdx = srcInfos.size() / 2;
 
     for (size_t i = 0; i < srcInfos.size(); ++i) {
         if (is_ofx_aborted(effect)) {
             release_all_clips();
-            return kOfxStatOK;
+            return kOfxStatFailed;
         }
         const OfxImgInfo& si = srcInfos[i];
         librenoise::VideoFrame32F f(width, height);
@@ -1415,7 +1447,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 
     if (is_ofx_aborted(effect)) {
         release_all_clips();
-        return kOfxStatOK;
+        return kOfxStatFailed;
     }
 
     librenoise::VideoDenoiser::Config config;
@@ -1453,11 +1485,10 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 
     if (is_ofx_aborted(effect)) {
         release_all_clips();
-        return kOfxStatOK;
+        return kOfxStatFailed;
     }
 
     const auto& refFrame = frameWindow[refIdx];
-    const OfxImgInfo& refSrcInfo = srcInfos[refIdx];
     float mixFactor = static_cast<float>(mixWithOriginal);
     const int outCh = outInfo.channels;
 
@@ -1487,12 +1518,12 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     b = b * (1.0f - mixFactor) + rawB * mixFactor;
                 }
 
-                // Preserve linear-light HDR values > 1.0f and original source alpha
+                // Preserve linear-light HDR values > 1.0f and original source alpha (or 1.0 for RGB/DPX)
                 if (outCh >= 3) {
                     dstRow[x * outCh + 0] = std::max(0.0f, r);
                     dstRow[x * outCh + 1] = std::max(0.0f, g);
                     dstRow[x * outCh + 2] = std::max(0.0f, b);
-                    if (outCh >= 4) dstRow[x * outCh + 3] = sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy);
+                    if (outCh >= 4) dstRow[x * outCh + 3] = sourceHasAlpha ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f;
                 } else if (outCh == 1) {
                     dstRow[x] = std::max(0.0f, r);
                 }
@@ -1510,7 +1541,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     denoised.channels[0].at(x, y),
                     denoised.channels[1].at(x, y),
                     denoised.channels[2].at(x, y),
-                    (outCh >= 4) ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f
+                    (outCh >= 4) ? (sourceHasAlpha ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f) : 1.0f
                 };
                 float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
                 for (int c = 0; c < 3; ++c) {
@@ -1533,7 +1564,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
                     denoised.channels[0].at(x, y),
                     denoised.channels[1].at(x, y),
                     denoised.channels[2].at(x, y),
-                    (outCh >= 4) ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f
+                    (outCh >= 4) ? (sourceHasAlpha ? sample_ofx_alpha(refSrcInfo, outInfo.bounds[0] + x, wy) : 1.0f) : 1.0f
                 };
                 float raw[3] = {refFrame.channels[0].at(x, y), refFrame.channels[1].at(x, y), refFrame.channels[2].at(x, y)};
                 for (int c = 0; c < 3; ++c) {

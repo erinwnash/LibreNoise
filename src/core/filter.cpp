@@ -4,6 +4,9 @@
 #include <vector>
 #include <algorithm>
 #include <array>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -18,6 +21,7 @@ namespace {
 // =========================================================================
 struct DctTableInit {
     float mat[8][8];
+    float mat_t[8][8]; // transpose, for row-vector products
     DctTableInit() {
         constexpr float s0 = 0.35355339059327376f;
         constexpr float s = 0.5f;
@@ -28,6 +32,8 @@ struct DctTableInit {
                 mat[k][n] = factor * static_cast<float>(std::cos((pi / 8.0) * (n + 0.5) * k));
             }
         }
+        for (int k = 0; k < 8; ++k)
+            for (int n = 0; n < 8; ++n) mat_t[n][k] = mat[k][n];
     }
 };
 static const DctTableInit g_dct_table;
@@ -48,6 +54,44 @@ inline void idct8_1d(const float in[8], float out[8]) {
     }
 }
 
+#if defined(__AVX2__)
+// 8x8 separable DCT as two 8x8 matrix products held entirely in YMM registers (128 FMAs per transform).
+void dct8x8_2d(const float in[64], float out[64]) {
+    const auto& m = g_dct_table;
+    __m256 mt[8], t[8];
+    for (int i = 0; i < 8; ++i) mt[i] = _mm256_loadu_ps(m.mat_t[i]);
+    // T[r][:] = sum_n X[r][n] * M[:][n]
+    for (int r = 0; r < 8; ++r) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(in[r * 8 + 0]), mt[0]);
+        for (int n = 1; n < 8; ++n) acc = _mm256_fmadd_ps(_mm256_set1_ps(in[r * 8 + n]), mt[n], acc);
+        t[r] = acc;
+    }
+    // out[k][:] = sum_r M[k][r] * T[r][:]
+    for (int k = 0; k < 8; ++k) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(m.mat[k][0]), t[0]);
+        for (int r = 1; r < 8; ++r) acc = _mm256_fmadd_ps(_mm256_set1_ps(m.mat[k][r]), t[r], acc);
+        _mm256_storeu_ps(out + k * 8, acc);
+    }
+}
+
+void idct8x8_2d(const float in[64], float out[64]) {
+    const auto& m = g_dct_table;
+    __m256 mr[8], u[8];
+    for (int i = 0; i < 8; ++i) mr[i] = _mm256_loadu_ps(m.mat[i]);
+    // U[k][:] = sum_l Y[k][l] * M[l][:]
+    for (int k = 0; k < 8; ++k) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(in[k * 8 + 0]), mr[0]);
+        for (int l = 1; l < 8; ++l) acc = _mm256_fmadd_ps(_mm256_set1_ps(in[k * 8 + l]), mr[l], acc);
+        u[k] = acc;
+    }
+    // out[n][:] = sum_k M[k][n] * U[k][:]
+    for (int n = 0; n < 8; ++n) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(m.mat[0][n]), u[0]);
+        for (int k = 1; k < 8; ++k) acc = _mm256_fmadd_ps(_mm256_set1_ps(m.mat[k][n]), u[k], acc);
+        _mm256_storeu_ps(out + n * 8, acc);
+    }
+}
+#else
 void dct8x8_2d(const float in[64], float out[64]) {
     float temp[64];
     for (int r = 0; r < 8; ++r) dct8_1d(&in[r * 8], &temp[r * 8]);
@@ -69,34 +113,43 @@ void idct8x8_2d(const float in[64], float out[64]) {
     }
     for (int r = 0; r < 8; ++r) idct8_1d(&temp[r * 8], &out[r * 8]);
 }
+#endif
+
+// Orthonormal DCT-II basis for every possible temporal group size (1..12), built once.
+// basis[K][k][n] already includes the alpha normalisation, so no trig runs in the hot loops.
+struct TemporalDctTable {
+    float basis[13][12][12];
+    TemporalDctTable() {
+        constexpr double pi = 3.14159265358979323846;
+        for (int K = 0; K <= 12; ++K)
+            for (int k = 0; k < 12; ++k)
+                for (int n = 0; n < 12; ++n) basis[K][k][n] = 0.0f;
+        for (int K = 1; K <= 12; ++K) {
+            const double a0 = std::sqrt(1.0 / K), a = std::sqrt(2.0 / K);
+            for (int k = 0; k < K; ++k)
+                for (int n = 0; n < K; ++n)
+                    basis[K][k][n] = static_cast<float>((k == 0 ? a0 : a) * std::cos(pi / K * (n + 0.5) * k));
+        }
+    }
+};
+static const TemporalDctTable g_tdct_table;
 
 void temporal_dct_forward(const float* in, float* out, int K) {
     if (K <= 1) { out[0] = in[0]; return; }
-    const float alpha0 = std::sqrt(1.0f / static_cast<float>(K));
-    const float alpha = std::sqrt(2.0f / static_cast<float>(K));
-    const float pi = 3.141592653589793f;
-
+    const auto& b = g_tdct_table.basis[K];
     for (int k = 0; k < K; ++k) {
-        float factor = (k == 0) ? alpha0 : alpha;
         float sum = 0.0f;
-        for (int n = 0; n < K; ++n) {
-            sum += in[n] * std::cos((pi / static_cast<float>(K)) * (n + 0.5f) * k);
-        }
-        out[k] = factor * sum;
+        for (int n = 0; n < K; ++n) sum += b[k][n] * in[n];
+        out[k] = sum;
     }
 }
 
 void temporal_dct_inverse(const float* in, float* out, int K) {
     if (K <= 1) { out[0] = in[0]; return; }
-    const float alpha0 = std::sqrt(1.0f / static_cast<float>(K));
-    const float alpha = std::sqrt(2.0f / static_cast<float>(K));
-    const float pi = 3.141592653589793f;
-
+    const auto& b = g_tdct_table.basis[K];
     for (int n = 0; n < K; ++n) {
-        float sum = alpha0 * in[0];
-        for (int k = 1; k < K; ++k) {
-            sum += alpha * in[k] * std::cos((pi / static_cast<float>(K)) * (n + 0.5f) * k);
-        }
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) sum += b[k][n] * in[k];
         out[n] = sum;
     }
 }
@@ -187,6 +240,23 @@ ImagePlane32F compute_temporal_average(
 
 } // anonymous namespace
 
+// Row-band accumulator: a thread only needs the rows its patch strip can touch, not a full frame.
+struct BandPlane {
+    int32_t w = 0, y0 = 0, rows = 0;
+    std::vector<float> d;
+    BandPlane(int32_t w_, int32_t y0_, int32_t rows_)
+        : w(w_), y0(y0_), rows(rows_), d(static_cast<size_t>(w_) * static_cast<size_t>(rows_), 0.0f) {}
+    inline float& at(int32_t x, int32_t y) { return d[static_cast<size_t>(y - y0) * static_cast<size_t>(w) + static_cast<size_t>(x)]; }
+};
+
+inline int32_t strip_chunk_count(int32_t patch_rows) {
+    int32_t threads = 1;
+#ifdef _OPENMP
+    threads = std::max(1, omp_get_max_threads());
+#endif
+    return std::max<int32_t>(1, std::min<int32_t>(patch_rows, threads * 4));
+}
+
 // =========================================================================
 // Engine 1: 3D Collaborative Transform Filter (2-Stage V-BM3D + Non-Local Wiener)
 // =========================================================================
@@ -223,16 +293,25 @@ void CollaborativePatchFilter3D::process_plane(
 
     const ImagePlane32F* ref_plane = temporal_planes[ref_index];
 
-    // Pass 1: Motion-Compensated 3D Hard-Thresholding -> Pilot
-    #pragma omp parallel
-    {
-        ImagePlane32F local_num(w, h);
-        ImagePlane32F local_den(w, h);
-        local_num.fill(0.0f);
-        local_den.fill(0.0f);
+    // Per-coefficient band scale (profile PSD x user band weight), shared by every patch
+    alignas(32) float bsc[64];
+    for (int c = 0; c < 64; ++c) {
+        const int band = band_for_uv_cpu(c & 7, c >> 3);
+        bsc[c] = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
+    }
 
-        #pragma omp for schedule(dynamic)
-        for (int32_t iy = 0; iy < npy; ++iy) {
+    // Pass 1: Motion-Compensated 3D Hard-Thresholding -> Pilot
+    const int32_t n_chunks = strip_chunk_count(npy);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+        const int32_t iy_lo = static_cast<int32_t>(static_cast<int64_t>(npy) * chunk / n_chunks);
+        const int32_t iy_hi = static_cast<int32_t>(static_cast<int64_t>(npy) * (chunk + 1) / n_chunks);
+        const int32_t band_y0 = std::min(iy_lo * step, h - ps);
+        const int32_t band_y1 = std::min((iy_hi - 1) * step, h - ps) + ps;
+        BandPlane local_num(w, band_y0, band_y1 - band_y0);
+        BandPlane local_den(w, band_y0, band_y1 - band_y0);
+
+        for (int32_t iy = iy_lo; iy < iy_hi; ++iy) {
             int32_t y = std::min(iy * step, h - ps);
             for (int32_t ix = 0; ix < npx; ++ix) {
                 int32_t x = std::min(ix * step, w - ps);
@@ -299,40 +378,43 @@ void CollaborativePatchFilter3D::process_plane(
                 float spatial_coeffs[9][64];
                 for (int k = 0; k < K; ++k) dct8x8_2d(group[k], spatial_coeffs[k]);
 
-                float transform_3d[9][64];
-                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    float temp_in[9], temp_out[9];
-                    for (int k = 0; k < K; ++k) temp_in[k] = spatial_coeffs[k][coeff_idx];
-                    temporal_dct_forward(temp_in, temp_out, K);
-                    for (int k = 0; k < K; ++k) transform_3d[k][coeff_idx] = temp_out[k];
-                }
-
-                int non_zero_count = 0;
-                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    int u = coeff_idx & 7;
-                    int v = coeff_idx >> 3;
-                    int band = band_for_uv_cpu(u, v);
-                    float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
-                    float sp_thresh = params.hard_thresh_lambda * sigma * bscale;
-                    float tm_thresh = sp_thresh * std::max(0.5f, params.temporal_weight);
-
-                    for (int k = 0; k < K; ++k) {
-                        if (k == 0 && coeff_idx == 0) { non_zero_count++; continue; }
-                        float thresh = (k == 0) ? sp_thresh : tm_thresh;
-                        if (std::abs(transform_3d[k][coeff_idx]) < thresh) {
-                            transform_3d[k][coeff_idx] = 0.0f;
-                        } else {
-                            non_zero_count++;
-                        }
+                // 3D transform: temporal DCT across all 64 spatial coefficients at once
+                const auto& tb = g_tdct_table.basis[K];
+                alignas(32) float transform_3d[9][64];
+                for (int k = 0; k < K; ++k) {
+                    float* __restrict t3 = transform_3d[k];
+                    for (int c = 0; c < 64; ++c) t3[c] = 0.0f;
+                    for (int n = 0; n < K; ++n) {
+                        const float bkn = tb[k][n];
+                        const float* __restrict sc = spatial_coeffs[n];
+                        for (int c = 0; c < 64; ++c) t3[c] += bkn * sc[c];
                     }
                 }
 
-                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    float temp_in[9], temp_out[9];
-                    for (int k = 0; k < K; ++k) temp_in[k] = transform_3d[k][coeff_idx];
-                    temporal_dct_inverse(temp_in, temp_out, K);
-                    spatial_coeffs[0][coeff_idx] = temp_out[0];
+                // Hard threshold, then inverse temporal DCT of output 0 only (the reference slice)
+                const float tw_scale = std::max(0.5f, params.temporal_weight);
+                alignas(32) float out0[64];
+                for (int c = 0; c < 64; ++c) out0[c] = 0.0f;
+                int non_zero_count = 0;
+                for (int k = 0; k < K; ++k) {
+                    float* __restrict t3 = transform_3d[k];
+                    const float kt = params.hard_thresh_lambda * sigma * ((k == 0) ? 1.0f : tw_scale);
+                    const float dc = t3[0];
+                    int nz = 0;
+                    for (int c = 0; c < 64; ++c) {
+                        const bool keep = std::abs(t3[c]) >= kt * bsc[c];
+                        nz += keep ? 1 : 0;
+                        t3[c] = keep ? t3[c] : 0.0f;
+                    }
+                    if (k == 0) {   // DC of the reference slice is never thresholded and always counted
+                        if (t3[0] == 0.0f && dc != 0.0f) nz++;
+                        t3[0] = dc;
+                    }
+                    non_zero_count += nz;
+                    const float inv0 = tb[k][0];
+                    for (int c = 0; c < 64; ++c) out0[c] += inv0 * t3[c];
                 }
+                for (int c = 0; c < 64; ++c) spatial_coeffs[0][c] = out0[c];
 
                 float filtered_ref_patch[64];
                 idct8x8_2d(spatial_coeffs[0], filtered_ref_patch);
@@ -351,13 +433,11 @@ void CollaborativePatchFilter3D::process_plane(
 
         #pragma omp critical
         {
-            float* num_ptr = numerator.data();
-            float* den_ptr = denominator.data();
-            const float* lnum_ptr = local_num.data();
-            const float* lden_ptr = local_den.data();
-            for (size_t i = 0; i < total_pixels; ++i) {
-                num_ptr[i] += lnum_ptr[i];
-                den_ptr[i] += lden_ptr[i];
+            for (int32_t yy = band_y0; yy < band_y1; ++yy) {
+                for (int32_t xx = 0; xx < w; ++xx) {
+                    numerator.at(xx, yy) += local_num.at(xx, yy);
+                    denominator.at(xx, yy) += local_den.at(xx, yy);
+                }
             }
         }
     }
@@ -375,22 +455,30 @@ void CollaborativePatchFilter3D::process_plane(
         return;
     }
 
+    // Per-coefficient squared band scale (profile PSD x user band weight), shared by every patch
+    alignas(32) float bs2[64];
+    for (int c = 0; c < 64; ++c) {
+        const float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band_for_uv_cpu(c & 7, c >> 3)] * params.band_weights[band_for_uv_cpu(c & 7, c >> 3)]);
+        bs2[c] = bscale * bscale;
+    }
+
     // Pass 2: Spatiotemporal Non-Local Collaborative 3D Empirical Wiener
     numerator.fill(0.0f);
     denominator.fill(0.0f);
 
-    #pragma omp parallel
-    {
-        ImagePlane32F local_num(w, h);
-        ImagePlane32F local_den(w, h);
-        local_num.fill(0.0f);
-        local_den.fill(0.0f);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+        const int32_t iy_lo = static_cast<int32_t>(static_cast<int64_t>(npy) * chunk / n_chunks);
+        const int32_t iy_hi = static_cast<int32_t>(static_cast<int64_t>(npy) * (chunk + 1) / n_chunks);
+        const int32_t band_y0 = std::min(iy_lo * step, h - ps);
+        const int32_t band_y1 = std::min((iy_hi - 1) * step, h - ps) + ps;
+        BandPlane local_num(w, band_y0, band_y1 - band_y0);
+        BandPlane local_den(w, band_y0, band_y1 - band_y0);
 
         const int ox_list[12] = {-5,  5,  0,  0, -5,  5, -5,  5, -10, 10,   0,  0};
         const int oy_list[12] = { 0,  0, -5,  5, -5, -5,  5,  5,   0,  0, -10, 10};
 
-        #pragma omp for schedule(dynamic)
-        for (int32_t iy = 0; iy < npy; ++iy) {
+        for (int32_t iy = iy_lo; iy < iy_hi; ++iy) {
             int32_t y = std::min(iy * step, h - ps);
             for (int32_t ix = 0; ix < npx; ++ix) {
                 int32_t x = std::min(ix * step, w - ps);
@@ -491,39 +579,46 @@ void CollaborativePatchFilter3D::process_plane(
                     dct8x8_2d(pilot_grp[k], p_spec[k]);
                 }
 
-                float w_sq_sum = 0.0f;
-                for (int coeff_idx = 0; coeff_idx < 64; ++coeff_idx) {
-                    int u = coeff_idx & 7;
-                    int v = coeff_idx >> 3;
-                    int band = band_for_uv_cpu(u, v);
-                    float bscale = std::max(0.05f, psd.octave_weights[ch_idx][band] * params.band_weights[band]);
-                    float nvar = (sigma * bscale) * (sigma * bscale);
-
-                    float ny_in[12], py_in[12], ny_out[12], ny_inv[12];
-                    for (int k = 0; k < K; ++k) {
-                        ny_in[k] = n_spec[k][coeff_idx];
-                        py_in[k] = p_spec[k][coeff_idx];
+                // Temporal DCT across all 64 spatial coefficients at once (contiguous, vectorizable)
+                const auto& tb = g_tdct_table.basis[K];
+                alignas(32) float n_t[12][64], p_t[12][64];
+                for (int k = 0; k < K; ++k) {
+                    float* __restrict nt = n_t[k];
+                    float* __restrict pt = p_t[k];
+                    for (int c = 0; c < 64; ++c) { nt[c] = 0.0f; pt[c] = 0.0f; }
+                    for (int n = 0; n < K; ++n) {
+                        const float bkn = tb[k][n];
+                        const float* __restrict ns = n_spec[n];
+                        const float* __restrict ps_ = p_spec[n];
+                        for (int c = 0; c < 64; ++c) { nt[c] += bkn * ns[c]; pt[c] += bkn * ps_[c]; }
                     }
-                    float n_tdct[12], p_tdct[12];
-                    temporal_dct_forward(ny_in, n_tdct, K);
-                    temporal_dct_forward(py_in, p_tdct, K);
-
-                    for (int k = 0; k < K; ++k) {
-                        if (k == 0 && coeff_idx == 0) {
-                            ny_out[0] = n_tdct[0];
-                            w_sq_sum += 1.0f;
-                        } else {
-                            float p2 = p_tdct[k] * p_tdct[k];
-                            float eff_nvar = (k == 0) ? nvar : (nvar * std::max(0.5f, params.temporal_weight));
-                            float w_gain = p2 / (p2 + eff_nvar + 1e-10f);
-                            ny_out[k] = n_tdct[k] * w_gain;
-                            w_sq_sum += w_gain * w_gain;
-                        }
-                    }
-
-                    temporal_dct_inverse(ny_out, ny_inv, K);
-                    n_spec[0][coeff_idx] = ny_inv[0];
                 }
+
+                // Wiener shrinkage per (temporal k, spatial c); only temporal output 0 of the inverse is used
+                const float sigma2 = sigma * sigma;
+                const float tw_scale = std::max(0.5f, params.temporal_weight);
+                alignas(32) float out0[64];
+                for (int c = 0; c < 64; ++c) out0[c] = 0.0f;
+                float w_sq_sum = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    const float kscale = sigma2 * ((k == 0) ? 1.0f : tw_scale);
+                    alignas(32) float gain[64];
+                    const float* __restrict pt = p_t[k];
+                    for (int c = 0; c < 64; ++c) {
+                        const float p2 = pt[c] * pt[c];
+                        gain[c] = p2 / (p2 + kscale * bs2[c] + 1e-10f);
+                    }
+                    if (k == 0) gain[0] = 1.0f; // DC of the reference stays untouched
+                    const float inv0 = tb[k][0];
+                    const float* __restrict nt = n_t[k];
+                    float gsq = 0.0f;
+                    for (int c = 0; c < 64; ++c) {
+                        out0[c] += inv0 * nt[c] * gain[c];
+                        gsq += gain[c] * gain[c];
+                    }
+                    w_sq_sum += gsq;
+                }
+                for (int c = 0; c < 64; ++c) n_spec[0][c] = out0[c];
 
                 float wiener_patch[64];
                 idct8x8_2d(n_spec[0], wiener_patch);
@@ -542,13 +637,11 @@ void CollaborativePatchFilter3D::process_plane(
 
         #pragma omp critical
         {
-            float* num_ptr = numerator.data();
-            float* den_ptr = denominator.data();
-            const float* lnum_ptr = local_num.data();
-            const float* lden_ptr = local_den.data();
-            for (size_t i = 0; i < total_pixels; ++i) {
-                num_ptr[i] += lnum_ptr[i];
-                den_ptr[i] += lden_ptr[i];
+            for (int32_t yy = band_y0; yy < band_y1; ++yy) {
+                for (int32_t xx = 0; xx < w; ++xx) {
+                    numerator.at(xx, yy) += local_num.at(xx, yy);
+                    denominator.at(xx, yy) += local_den.at(xx, yy);
+                }
             }
         }
     }
@@ -711,41 +804,94 @@ void NonLocalMeansFilter::process_plane(
     const int32_t r_patch = params.nlm_patch_radius;   // 2 -> 5x5 patch
     const float patch_norm = 1.0f / static_cast<float>((2 * r_patch + 1) * (2 * r_patch + 1));
 
-    #pragma omp parallel for schedule(dynamic)
+    // Exact accelerated NLM: for every search offset, one squared-difference image is box-summed
+    // (separable, O(1) per pixel) to give all patch distances at once, instead of re-comparing a full
+    // patch for every pixel/candidate pair. Same weights, same accumulation order as the direct form.
+    const int32_t R = r_patch;
+    const int32_t pw = w + 2 * R, ph = h + 2 * R;
+    // Edge-replicated padded copy: reproduces the clamped centre-patch reads of the direct form
+    std::vector<float> pad(static_cast<size_t>(pw) * static_cast<size_t>(ph));
+    #pragma omp parallel for schedule(static)
+    for (int32_t j = 0; j < ph; ++j) {
+        const int32_t yy = std::clamp(j - R, 0, h - 1);
+        for (int32_t i = 0; i < pw; ++i) pad[static_cast<size_t>(j) * pw + i] = temp_accum.at(std::clamp(i - R, 0, w - 1), yy);
+    }
+
+    std::vector<float> sig2(static_cast<size_t>(w) * h), hsq(static_cast<size_t>(w) * h);
+    std::vector<float> val_sum(static_cast<size_t>(w) * h, 0.0f), weight_sum(static_cast<size_t>(w) * h, 0.0f);
+    #pragma omp parallel for schedule(static)
     for (int32_t y = 0; y < h; ++y) {
         for (int32_t x = 0; x < w; ++x) {
-            float center_val = temp_accum.at(x, y);
-            float sigma = effective_sigma_cpu(nlf, params, center_val) * max_b;
-            float h_sq = params.nlm_h_factor * sigma * sigma * 2.0f + 1e-6f;
+            const float sigma = effective_sigma_cpu(nlf, params, temp_accum.at(x, y)) * max_b;
+            sig2[static_cast<size_t>(y) * w + x] = sigma * sigma;
+            hsq[static_cast<size_t>(y) * w + x] = params.nlm_h_factor * sigma * sigma * 2.0f + 1e-6f;
+        }
+    }
 
-            float weight_sum = 0.0f;
-            float val_sum = 0.0f;
+    // Each task owns a band of output rows and runs every search offset inside it: no barriers,
+    // no shared writes, and the working set stays in cache.
+    const int32_t n_bands = std::max<int32_t>(1, std::min<int32_t>(h, strip_chunk_count(h)));
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int32_t band = 0; band < n_bands; ++band) {
+        const int32_t y0 = static_cast<int32_t>(static_cast<int64_t>(h) * band / n_bands);
+        const int32_t y1 = static_cast<int32_t>(static_cast<int64_t>(h) * (band + 1) / n_bands);
+        if (y1 <= y0) continue;
+        const int32_t rows = y1 - y0 + 2 * R;
+        std::vector<float> hbuf(static_cast<size_t>(rows) * w);
+        std::vector<float> dist(static_cast<size_t>(w)), wv(static_cast<size_t>(w));
 
-            int32_t min_sy = std::max(r_patch, y - r_search);
-            int32_t max_sy = std::min(h - 1 - r_patch, y + r_search);
-            int32_t min_sx = std::max(r_patch, x - r_search);
-            int32_t max_sx = std::min(w - 1 - r_patch, x + r_search);
+        for (int32_t oy = -r_search; oy <= r_search; ++oy) {
+            // Output rows whose candidate patch row stays inside the image
+            const int32_t ya = std::max(y0, R - oy);
+            const int32_t yb = std::min(y1 - 1, h - 1 - R - oy);
+            if (ya > yb) continue;
+            for (int32_t ox = -r_search; ox <= r_search; ++ox) {
+                const int32_t xa = std::max(0, R - ox);
+                const int32_t xb = std::min(w - 1, w - 1 - R - ox);
+                if (xa > xb) continue;
+                const int32_t n = xb - xa + 1;
 
-            for (int32_t sy = min_sy; sy <= max_sy; ++sy) {
-                for (int32_t sx = min_sx; sx <= max_sx; ++sx) {
-                    float dist = 0.0f;
-                    for (int32_t py = -r_patch; py <= r_patch; ++py) {
-                        for (int32_t px = -r_patch; px <= r_patch; ++px) {
-                            int32_t rx = std::clamp(x + px, 0, w - 1);
-                            int32_t ry = std::clamp(y + py, 0, h - 1);
-                            float diff = temp_accum.at(rx, ry) - temp_accum.at(sx + px, sy + py);
-                            dist += diff * diff;
+                // Horizontal box sums of squared differences for padded rows ya .. yb+2R
+                for (int32_t j = ya; j <= yb + 2 * R; ++j) {
+                    float* __restrict hrow = &hbuf[static_cast<size_t>(j - y0) * w];
+                    const float* __restrict ar = &pad[static_cast<size_t>(j) * pw];
+                    const float* __restrict cr = &pad[static_cast<size_t>(j + oy) * pw + ox];
+                    for (int32_t x = 0; x < n; ++x) hrow[xa + x] = 0.0f;
+                    for (int32_t k = 0; k <= 2 * R; ++k) {
+                        for (int32_t x = 0; x < n; ++x) {
+                            const float d = ar[xa + x + k] - cr[xa + x + k];
+                            hrow[xa + x] += d * d;
                         }
                     }
-                    dist *= patch_norm;
+                }
 
-                    float w_val = std::exp(-std::max(0.0f, dist - 2.0f * sigma * sigma) / h_sq);
-                    val_sum += temp_accum.at(sx, sy) * w_val;
-                    weight_sum += w_val;
+                for (int32_t y = ya; y <= yb; ++y) {
+                    float* __restrict dst = dist.data();
+                    for (int32_t x = 0; x < n; ++x) dst[x] = 0.0f;
+                    for (int32_t k = 0; k <= 2 * R; ++k) {
+                        const float* __restrict hrow = &hbuf[static_cast<size_t>(y + k - y0) * w + xa];
+                        for (int32_t x = 0; x < n; ++x) dst[x] += hrow[x];
+                    }
+                    const size_t base = static_cast<size_t>(y) * w + xa;
+                    for (int32_t x = 0; x < n; ++x) {
+                        const float d = dst[x] * patch_norm;
+                        wv[x] = std::exp(-std::max(0.0f, d - 2.0f * sig2[base + x]) / hsq[base + x]);
+                    }
+                    const float* cand = temp_accum.data() + static_cast<ptrdiff_t>(y + oy) * temp_accum.stride() + xa + ox;
+                    for (int32_t x = 0; x < n; ++x) {
+                        val_sum[base + x] += cand[x] * wv[x];
+                        weight_sum[base + x] += wv[x];
+                    }
                 }
             }
+        }
+    }
 
-            output_plane.at(x, y) = (weight_sum > 1e-6f) ? (val_sum / weight_sum) : center_val;
+    #pragma omp parallel for schedule(static)
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const size_t idx = static_cast<size_t>(y) * w + x;
+            output_plane.at(x, y) = (weight_sum[idx] > 1e-6f) ? (val_sum[idx] / weight_sum[idx]) : temp_accum.at(x, y);
         }
     }
 }
@@ -784,15 +930,17 @@ void FrequencyDomainFilter3D::process_plane(
     numerator.fill(0.0f);
     denominator.fill(0.0f);
 
-    #pragma omp parallel
-    {
-        ImagePlane32F local_num(w, h);
-        ImagePlane32F local_den(w, h);
-        local_num.fill(0.0f);
-        local_den.fill(0.0f);
+    const int32_t n_chunks = strip_chunk_count(npy);
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int32_t chunk = 0; chunk < n_chunks; ++chunk) {
+        const int32_t iy_lo = static_cast<int32_t>(static_cast<int64_t>(npy) * chunk / n_chunks);
+        const int32_t iy_hi = static_cast<int32_t>(static_cast<int64_t>(npy) * (chunk + 1) / n_chunks);
+        const int32_t band_y0 = std::min(iy_lo * step, h - bs);
+        const int32_t band_y1 = std::min((iy_hi - 1) * step, h - bs) + bs;
+        BandPlane local_num(w, band_y0, band_y1 - band_y0);
+        BandPlane local_den(w, band_y0, band_y1 - band_y0);
 
-        #pragma omp for schedule(dynamic)
-        for (int32_t iy = 0; iy < npy; ++iy) {
+        for (int32_t iy = iy_lo; iy < iy_hi; ++iy) {
             int32_t y = std::min(iy * step, h - bs);
             for (int32_t ix = 0; ix < npx; ++ix) {
                 int32_t x = std::min(ix * step, w - bs);
@@ -845,14 +993,11 @@ void FrequencyDomainFilter3D::process_plane(
 
         #pragma omp critical
         {
-            float* num_ptr = numerator.data();
-            float* den_ptr = denominator.data();
-            const float* lnum_ptr = local_num.data();
-            const float* lden_ptr = local_den.data();
-            size_t total = static_cast<size_t>(w * h);
-            for (size_t i = 0; i < total; ++i) {
-                num_ptr[i] += lnum_ptr[i];
-                den_ptr[i] += lden_ptr[i];
+            for (int32_t yy = band_y0; yy < band_y1; ++yy) {
+                for (int32_t xx = 0; xx < w; ++xx) {
+                    numerator.at(xx, yy) += local_num.at(xx, yy);
+                    denominator.at(xx, yy) += local_den.at(xx, yy);
+                }
             }
         }
     }

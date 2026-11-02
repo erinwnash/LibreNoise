@@ -1,5 +1,4 @@
 #include "librenoise/librenoise.hpp"
-#include "librenoise/colorspace.hpp"
 #include "librenoise/gpu_denoiser.hpp"
 #include "librenoise/roi_analyzer.hpp"
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
@@ -451,10 +450,9 @@ int main(int argc, char* argv[]) {
         cp.temporal_weight = 1.0f;
         cp.spatial_weight = 1.0f;
         for (int b = 0; b < 5; ++b) cp.band_weights[b] = 1.0f;
-        const auto gt_ycc = colorspace::rgb_nlf_to_ycc({ground_truth.nlf, ground_truth.nlf, ground_truth.nlf});
         for (int c = 0; c < 3; ++c) {
-            cp.nlf_a[c] = gt_ycc[c].a;
-            cp.nlf_b[c] = gt_ycc[c].b;
+            cp.nlf_a[c] = ground_truth.nlf.a;
+            cp.nlf_b[c] = ground_truth.nlf.b;
         }
         cp.detail_recovery = 0.05f;
         cp.grain_amount = 0.0f;

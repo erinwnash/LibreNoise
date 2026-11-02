@@ -197,7 +197,7 @@ int run_stress_benchmark(bool oracle, bool white_noise) {
     NoiseProfile profile;
     if (oracle) {
         profile.profile_name = "Oracle";
-        profile.nlf_per_channel = colorspace::rgb_nlf_to_ycc({truth, truth, truth});
+        profile.nlf_per_channel = std::array<NoiseLevelFunction, 3>{truth, truth, truth};
         if (correlated) {
             // Analytic PSD of the 3x3-binomial-blurred noise, folded into the 5 radial DCT bands
             double be[5] = {0, 0, 0, 0, 0}; int bc[5] = {0, 0, 0, 0, 0}; double tot = 0; int tn = 0;

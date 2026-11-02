@@ -30,19 +30,14 @@ struct FilterParams {
     bool fast_chroma = true;         // Subsample chroma patch evaluations by 2x
     bool early_exit_motion = true;   // Terminate block matching early when error < noise floor
 
-    // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High].
-    // Each value multiplies the noise threshold used for that spatial-frequency band on top of the
-    // measured profile PSD: 1.0 = remove exactly the measured noise, >1 removes more, <1 keeps more.
+    // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High]
     std::array<float, 5> band_weights{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::array<float, 5> tonal_lut{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-    // Noise reduction amount per working-space channel (the filter operates in Y/Cb/Cr).
-    float luma_scale = 1.0f;
+    float luma_scale = 1.0f;         // Luma (Y) noise-reduction amount
     float chroma_scale_cb = 1.0f;
     float chroma_scale_cr = 1.0f;
-    int32_t channel_index = 0;   // 0 = Y, 1 = Cb, 2 = Cr (set by the dispatcher)
-    // Luma plane of the reference frame. Chroma planes look their noise level up against luma
-    // intensity (shot noise depends on brightness, not on colour-difference value).
-    const ImagePlane32F* luma_guide = nullptr;
+    float channel_amount = 1.0f;     // per-plane amount derived from luma/cb/cr sliders (set by the dispatcher)
+    int32_t channel_index = 0;
 
     // Collaborative 3D Parameters
     int32_t patch_size = 8;
@@ -72,7 +67,7 @@ struct FilterParams {
     // Host Cooperative Abort & Threading Governance
     bool (*abort_fn)(void* user_data) = nullptr;
     void* abort_user_data = nullptr;
-    int32_t max_threads = 0; // 0 = polite hardware auto-cap
+    int32_t max_threads = 0; // 0 = default OpenMP thread count
 
     inline bool is_aborted() const noexcept {
         return abort_fn != nullptr && abort_fn(abort_user_data);

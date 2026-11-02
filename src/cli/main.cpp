@@ -1,4 +1,5 @@
 #include "librenoise/librenoise.hpp"
+#include "librenoise/colorspace.hpp"
 #include "librenoise/gpu_denoiser.hpp"
 #include "librenoise/roi_analyzer.hpp"
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
@@ -327,17 +328,24 @@ int run_dpx_benchmark(const std::string& dpx_arg, bool include_cpu) {
 
 } // namespace
 
+int run_stress_benchmark(bool oracle, bool white_noise);
+
 int main(int argc, char* argv[]) {
     std::string dpx_path;
     bool dpx_cpu = false;
+    bool stress = false, stress_oracle = false, stress_white = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+        if (a == "--stress") stress = true;
+        if (a == "--oracle") stress_oracle = true;
+        if (a == "--white") stress_white = true;
         if (a == "--dpx" && i + 1 < argc) {
             dpx_path = argv[++i];
         } else if (a == "--cpu") {
             dpx_cpu = true;
         }
     }
+    if (stress) return run_stress_benchmark(stress_oracle, stress_white);
     if (!dpx_path.empty()) {
         return run_dpx_benchmark(dpx_path, dpx_cpu);
     }
@@ -443,9 +451,10 @@ int main(int argc, char* argv[]) {
         cp.temporal_weight = 1.0f;
         cp.spatial_weight = 1.0f;
         for (int b = 0; b < 5; ++b) cp.band_weights[b] = 1.0f;
+        const auto gt_ycc = colorspace::rgb_nlf_to_ycc({ground_truth.nlf, ground_truth.nlf, ground_truth.nlf});
         for (int c = 0; c < 3; ++c) {
-            cp.nlf_a[c] = ground_truth.nlf.a;
-            cp.nlf_b[c] = ground_truth.nlf.b;
+            cp.nlf_a[c] = gt_ycc[c].a;
+            cp.nlf_b[c] = gt_ycc[c].b;
         }
         cp.detail_recovery = 0.05f;
         cp.grain_amount = 0.0f;

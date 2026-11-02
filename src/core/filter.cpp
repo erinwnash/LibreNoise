@@ -283,11 +283,10 @@ inline void accum_patch8x8_feathered_avx2(
     const float patch_aligned[64],
     float inv_weight
 ) noexcept {
-    const __m256 zero = _mm256_setzero_ps();
     const __m256 scale_v = _mm256_set1_ps(inv_weight);
     for (int py = 0; py < 8; ++py) {
         __m256 w_agg = _mm256_mul_ps(_mm256_load_ps(g_spatial_lut.feather_2d + py * 8), scale_v);
-        __m256 fv = _mm256_max_ps(zero, _mm256_load_ps(patch_aligned + py * 8));
+        __m256 fv = _mm256_load_ps(patch_aligned + py * 8);
         float* np = num_base + static_cast<ptrdiff_t>(py) * stride;
         float* dp = den_base + static_cast<ptrdiff_t>(py) * stride;
         _mm256_storeu_ps(np, _mm256_fmadd_ps(fv, w_agg, _mm256_loadu_ps(np)));
@@ -302,10 +301,49 @@ inline float eval_tonal_lut_cpu(const std::array<float, 5>& lut, float val) noex
     return lut[idx] * (1.0f - frac) + lut[idx + 1] * frac;
 }
 
+inline float effective_sigma_cpu_raw(const NoiseLevelFunction& nlf, const FilterParams& params, float luma_intensity) noexcept {
+    const float amount = (params.channel_index == 0) ? params.luma_scale
+                       : (params.channel_index == 1) ? params.chroma_scale_cb : params.chroma_scale_cr;
+    return nlf.sigma_at(luma_intensity) * params.spatial_weight * eval_tonal_lut_cpu(params.tonal_lut, luma_intensity) * amount;
+}
+
+// Noise level lookups always use LUMA intensity (shot noise follows brightness). Luma plane filters use
+// their own value; chroma planes consult the reference-frame luma guide when one is available.
 inline float effective_sigma_cpu(const NoiseLevelFunction& nlf, const FilterParams& params, float val) noexcept {
-    float chroma_mult = (params.channel_index == 0) ? params.chroma_scale_cr
-                      : (params.channel_index == 2) ? params.chroma_scale_cb : 1.0f;
-    return nlf.sigma_at(val) * params.spatial_weight * eval_tonal_lut_cpu(params.tonal_lut, val) * chroma_mult;
+    return effective_sigma_cpu_raw(nlf, params, val);
+}
+
+inline float guide_at(const FilterParams& params, int32_t x, int32_t y, float fallback) noexcept {
+    if (params.luma_guide == nullptr || params.channel_index == 0) return fallback;
+    const ImagePlane32F& g = *params.luma_guide;
+    return g.at(std::clamp(x, 0, g.width() - 1), std::clamp(y, 0, g.height() - 1));
+}
+
+inline float guide_patch_mean(const FilterParams& params, int32_t x, int32_t y, int32_t ps, float plane_mean) noexcept {
+    if (params.luma_guide == nullptr || params.channel_index == 0) return plane_mean;
+    const ImagePlane32F& g = *params.luma_guide;
+    const int32_t x0 = std::clamp(x, 0, std::max(0, g.width() - ps));
+    const int32_t y0 = std::clamp(y, 0, std::max(0, g.height() - ps));
+    float sum = 0.0f;
+    for (int32_t py = 0; py < ps; ++py) {
+        const float* row = g.data() + static_cast<ptrdiff_t>(y0 + py) * g.stride() + x0;
+        for (int32_t px = 0; px < ps; ++px) sum += row[px];
+    }
+    return sum / static_cast<float>(ps * ps);
+}
+
+// Motion lookup for patch-matching engines: an untrusted block falls back to zero motion and the
+// per-patch distance test (against the noise floor) decides whether the candidate is usable. This
+// avoids whole regions flipping between temporally-filtered and spatial-only from frame to frame.
+inline bool fetch_patch_motion(const MotionField* mf, int32_t px, int32_t py, int32_t& dx, int32_t& dy) noexcept {
+    dx = 0; dy = 0;
+    if (mf == nullptr) return true;
+    if (mf->is_valid()) {
+        const auto mv = mf->get_vector_at_pixel(px, py);
+        if (mv.trusted) { dx = mv.dx; dy = mv.dy; }
+        return true;
+    }
+    return !mf->is_scene_cut;
 }
 
 inline float max_band_scale_cpu(const NoisePsd& psd, const FilterParams& params) noexcept {
@@ -352,7 +390,7 @@ ImagePlane32F compute_temporal_average(
 
         for (int32_t x = 0; x < w; ++x) {
             float ref_val = temporal_planes[ref_index]->at(x, y);
-            float sigma = effective_sigma_cpu(nlf, params, ref_val) * max_b;
+            float sigma = effective_sigma_cpu(nlf, params, guide_at(params, x, y, ref_val)) * max_b;
             float trust_limit = 3.5f * sigma * params.temporal_weight;
 
             float sum = ref_val;
@@ -361,26 +399,19 @@ ImagePlane32F compute_temporal_average(
             for (size_t f = 0; f < temporal_planes.size(); ++f) {
                 if (f == ref_index) continue;
                 int32_t dx = 0, dy = 0;
-                bool trusted = true;
-                if (motion_fields[f]) {
-                    if (motion_fields[f]->is_valid()) {
-                        auto mv = motion_fields[f]->get_vector_at_pixel(x, y);
-                        dx = mv.dx;
-                        dy = mv.dy;
-                        trusted = mv.trusted;
-                    } else if (motion_fields[f]->is_scene_cut) {
-                        trusted = false;
-                    }
-                }
-                if (!trusted) continue;
+                if (!fetch_patch_motion(motion_fields[f], x, y, dx, dy)) continue;
 
                 int32_t cx = std::clamp(x + dx, 0, w - 1);
                 int32_t cy = std::clamp(y + dy, 0, h - 1);
                 float cand_val = temporal_planes[f]->at(cx, cy);
 
-                if (std::abs(ref_val - cand_val) <= trust_limit) {
-                    sum += cand_val;
-                    weight_sum += 1.0f;
+                // Smooth (Tukey biweight) acceptance: no hard in/out switch, so no frame-to-frame flicker
+                const float t = std::abs(ref_val - cand_val) / std::max(trust_limit, 1e-8f);
+                if (t < 1.0f) {
+                    const float u = 1.0f - t * t;
+                    const float wgt = u * u;
+                    sum += wgt * cand_val;
+                    weight_sum += wgt;
                 }
             }
             avg.at(x, y) = sum / weight_sum;
@@ -488,7 +519,7 @@ void CollaborativePatchFilter3D::process_plane(
                         group[0]
                     );
 
-                    float sigma = effective_sigma_cpu(nlf, params, mean_v);
+                    float sigma = effective_sigma_cpu(nlf, params, guide_patch_mean(params, x, y, ps, mean_v));
                     float eff_sig = sigma * max_b;
                     float trust_dist = 4.5f * std::max(0.25f, params.temporal_weight) * (eff_sig * eff_sig + 1e-6f);
 
@@ -498,18 +529,7 @@ void CollaborativePatchFilter3D::process_plane(
                             if (f == ref_index || K >= 9) continue;
 
                             int32_t disp_x = 0, disp_y = 0;
-                            bool trusted = true;
-                            if (motion_fields[f]) {
-                                if (motion_fields[f]->is_valid()) {
-                                    auto mv = motion_fields[f]->get_vector_at_pixel(x + 4, y + 4);
-                                    disp_x = mv.dx;
-                                    disp_y = mv.dy;
-                                    trusted = mv.trusted;
-                                } else if (motion_fields[f]->is_scene_cut) {
-                                    trusted = false;
-                                }
-                            }
-                            if (!trusted) continue;
+                            if (!fetch_patch_motion(motion_fields[f], x + 4, y + 4, disp_x, disp_y)) continue;
 
                             int32_t cand_x = std::clamp(x + disp_x, 0, w - ps);
                             int32_t cand_y = std::clamp(y + disp_y, 0, h - ps);
@@ -667,7 +687,7 @@ void CollaborativePatchFilter3D::process_plane(
                         pilot_grp[0]
                     );
 
-                    float sigma = effective_sigma_cpu(nlf, params, mean_p);
+                    float sigma = effective_sigma_cpu(nlf, params, guide_patch_mean(params, x, y, ps, mean_p));
                     float eff_var = (sigma * max_b) * (sigma * max_b) + 1e-7f;
                     int K = 1;
 
@@ -677,18 +697,7 @@ void CollaborativePatchFilter3D::process_plane(
                         for (size_t f = 0; f < temporal_planes.size(); ++f) {
                             if (f == ref_index || K >= 12) continue;
                             int32_t disp_x = 0, disp_y = 0;
-                            bool trusted = true;
-                            if (motion_fields[f]) {
-                                if (motion_fields[f]->is_valid()) {
-                                    auto mv = motion_fields[f]->get_vector_at_pixel(x + 4, y + 4);
-                                    disp_x = mv.dx;
-                                    disp_y = mv.dy;
-                                    trusted = mv.trusted;
-                                } else if (motion_fields[f]->is_scene_cut) {
-                                    trusted = false;
-                                }
-                            }
-                            if (!trusted) continue;
+                            if (!fetch_patch_motion(motion_fields[f], x + 4, y + 4, disp_x, disp_y)) continue;
 
                             int32_t cx = std::clamp(x + disp_x, 0, w - ps);
                             int32_t cy = std::clamp(y + disp_y, 0, h - ps);
@@ -894,6 +903,14 @@ void Wavelet5BandFilter::process_plane(
 
     pyramid[0] = current;
 
+    // Luma guide pyramid so chroma planes evaluate their noise level against local brightness
+    const bool use_guide = (params.luma_guide != nullptr && params.channel_index > 0);
+    std::vector<ImagePlane32F> guide_pyr;
+    if (use_guide) {
+        guide_pyr.resize(num_levels + 1);
+        guide_pyr[0] = *params.luma_guide;
+        for (int l = 0; l < num_levels; ++l) guide_pyr[l + 1] = downsample2x(guide_pyr[l], n_threads);
+    }
     for (int l = 0; l < num_levels; ++l) {
         if (params.is_aborted()) {
             output_plane = current;
@@ -914,7 +931,7 @@ void Wavelet5BandFilter::process_plane(
         for (int32_t y = 0; y < ph; ++y) {
             for (int32_t x = 0; x < pw; ++x) {
                 float raw_diff = pyramid[l].at(x, y) - up.at(x, y);
-                float base_val = up.at(x, y);
+                float base_val = use_guide ? guide_pyr[l].at(x, y) : up.at(x, y);
                 float sigma = effective_sigma_cpu(nlf, params, base_val);
 
                 float thresh = 1.6f * sigma * band_mult * level_scale;
@@ -936,7 +953,7 @@ void Wavelet5BandFilter::process_plane(
         #pragma omp parallel for schedule(static) num_threads(n_threads)
         for (int32_t y = 0; y < rh; ++y) {
             for (int32_t x = 0; x < rw; ++x) {
-                recon.at(x, y) = std::max(0.0f, up.at(x, y) + details[l].at(x, y));
+                recon.at(x, y) = up.at(x, y) + details[l].at(x, y);
             }
         }
     }
@@ -990,7 +1007,7 @@ void NonLocalMeansFilter::process_plane(
 
         for (int32_t x = 0; x < w; ++x) {
             float center_val = temp_accum.at(x, y);
-            float sigma = effective_sigma_cpu(nlf, params, center_val) * max_b;
+            float sigma = effective_sigma_cpu(nlf, params, guide_at(params, x, y, center_val)) * max_b;
             float sig_sq2 = 2.0f * sigma * sigma;
             float inv_h_sq = 1.0f / (params.nlm_h_factor * sig_sq2 + 1e-6f);
 
@@ -1141,7 +1158,7 @@ void FrequencyDomainFilter3D::process_plane(
                         src_stride,
                         block
                     );
-                    float sigma = effective_sigma_cpu(nlf, params, mean_v);
+                    float sigma = effective_sigma_cpu(nlf, params, guide_patch_mean(params, x, y, bs, mean_v));
                     __m256 sig_sq_v = _mm256_set1_ps(sigma * sigma);
 
                     dct8x8_2d(block, spectrum);
@@ -1245,6 +1262,8 @@ void FilterDispatcher::process(
 
         FilterParams channel_params = active_params;
         channel_params.channel_index = static_cast<int32_t>(c);
+        channel_params.luma_guide = (c > 0 && temporal_frames[ref_index].channel_count() >= 3)
+                                        ? &temporal_frames[ref_index].channels[0] : nullptr;
         if (c > 0 && active_params.fast_chroma) {
             channel_params.step_size = std::min(active_params.step_size + 2, 6);
         }

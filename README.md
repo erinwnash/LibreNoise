@@ -46,3 +46,7 @@ cmake --build build --config Release
 # Run Unit Tests & Benchmark Harness
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+## Docs
+
+- [Feature parity](docs/FEATURE_PARITY.md)

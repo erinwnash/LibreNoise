@@ -1,5 +1,6 @@
 add_executable(librenoise_cli
     main.cpp
+    stress.cpp
 )
 
 target_link_libraries(librenoise_cli PRIVATE librenoise_core)

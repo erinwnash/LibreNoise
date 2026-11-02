@@ -32,7 +32,9 @@ struct RoiAnalysisResult {
     float mean_intensity_y = 0.5f;
 
     // 5-Band Measured Frequency Spectrum (relative to baseline)
-    std::array<float, 5> measured_psd{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    std::array<float, 5> measured_psd{1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // luma (== measured_psd_ch[0])
+    // Per-channel spectrum [Y, Cb, Cr][band]; each row is relative to that channel's own noise level
+    std::array<std::array<float, 5>, 3> measured_psd_ch{{{1.0f, 1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f}}};
 
     // Resolved NLF
     NoiseLevelFunction nlf_y;

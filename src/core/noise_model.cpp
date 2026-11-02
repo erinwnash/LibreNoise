@@ -1,4 +1,5 @@
 #include "librenoise/noise_model.hpp"
+#include "librenoise/colorspace.hpp"
 #include <cmath>
 #include <numeric>
 #include <algorithm>
@@ -96,7 +97,9 @@ void detrended_mean_and_var(const ImagePlane32F& plane, int32_t bx, int32_t by, 
 
 } // anonymous namespace
 
-NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const ProfileParams& params) {
+NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame_in, const ProfileParams& params) {
+    // Noise is measured in the same Y/Cb/Cr working space the denoise engines operate in.
+    const VideoFrame32F frame = (frame_in.channel_count() >= 3) ? colorspace::to_ycc(frame_in) : frame_in;
     NoiseProfile profile;
     profile.profile_name = "AutoEstimated";
     profile.transfer = frame.transfer;
@@ -142,19 +145,16 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
                     float c0 = box4_sample(ch0, x + px, y + py);
                     float c1 = box4_sample(ch1, x + px, y + py);
                     float c2 = box4_sample(ch2, x + px, y + py);
-                    if (c0 <= 1e-4f || c1 <= 1e-4f || c2 <= 1e-4f) zero_count++;
+                    (void)c1; (void)c2;
+                    if (c0 <= 1e-4f) zero_count++; // clipped-black matte (luma only; chroma may be negative)
 
-                    float lum = (num_ch >= 3) ? (0.2126f * c0 + 0.7152f * c1 + 0.0722f * c2) : c0;
+                    float lum = c0;
                     mean_sum += lum;
                     min_lum = std::min(min_lum, lum);
                     max_lum = std::max(max_lum, lum);
 
                     float gx = box4_sample(ch0, x + px + 2, y + py) - box4_sample(ch0, x + px - 2, y + py);
                     float gy = box4_sample(ch0, x + px, y + py + 2) - box4_sample(ch0, x + px, y + py - 2);
-                    if (num_ch >= 2) {
-                        gx = 0.5f * gx + 0.5f * (box4_sample(ch1, x + px + 2, y + py) - box4_sample(ch1, x + px - 2, y + py));
-                        gy = 0.5f * gy + 0.5f * (box4_sample(ch1, x + px, y + py + 2) - box4_sample(ch1, x + px, y + py - 2));
-                    }
                     grad_sum += std::abs(gx) + std::abs(gy);
                     gcount++;
                 }
@@ -229,6 +229,10 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
             for (const auto& loc : flat_patches) {
                 float mean = 0.0f, var = 0.0f;
                 detrended_mean_and_var(plane, loc.x, loc.y, ps, mean, var);
+                if (c > 0) { // noise level is a function of LUMA brightness for every channel
+                    float dummy_var = 0.0f;
+                    detrended_mean_and_var(frame.channels[0], loc.x, loc.y, ps, mean, dummy_var);
+                }
                 float nv = var / std::max(0.03f, mean);
                 samples.push_back({loc.x, loc.y, mean, var, nv});
                 norm_vars.push_back(nv);
@@ -336,7 +340,7 @@ NoiseProfile NoiseProfiler::auto_estimate(const VideoFrame32F& frame, const Prof
                 for (size_t b = 0; b < 5; ++b) {
                     double b_pwr = (band_counts[b] > 0) ? (band_energy[b] / static_cast<double>(band_counts[b])) : mean_ac_pwr;
                     float sigma_scale = static_cast<float>(std::sqrt(std::max(0.0, b_pwr / mean_ac_pwr)));
-                    profile.psd.octave_weights[c][b] = std::clamp(sigma_scale, 0.75f, 3.0f);
+                    profile.psd.octave_weights[c][b] = std::clamp(sigma_scale, 0.3f, 4.0f);
                 }
             }
         } else {

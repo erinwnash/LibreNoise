@@ -1,4 +1,5 @@
 #include "librenoise/gpu_denoiser.hpp"
+#include "librenoise/colorspace.hpp"
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
@@ -50,8 +51,7 @@ struct GpuKernelConfig {
     float detail_recovery;
     float grain_amount;
     float mix_original;
-    float chroma_scale_cb;
-    float chroma_scale_cr;
+    float channel_amount[3];   // per-RGB-channel reduction amount derived from Luma / Cb / Cr sliders
     int preview_mode;
     int force_opaque_alpha;
     float band_weights[5];
@@ -207,6 +207,26 @@ __device__ inline float hash_noise(int x, int y, uint32_t seed) {
     return (static_cast<float>(n & 0x00FFFFFF) / static_cast<float>(0x00FFFFFF)) * 2.0f - 1.0f;
 }
 
+// Motion lookup shared by every temporal gather: a hard scene cut (pad==1) rejects the frame outright;
+// an untrusted block falls back to ZERO motion and lets the per-patch/pixel distance test decide.
+// Skipping the frame instead makes whole regions flip between temporal and spatial-only filtering
+// from one frame to the next, which is visible as boiling/flicker.
+__device__ inline bool resolve_motion(const GpuMotionVec& mv, int& dx, int& dy) {
+    if (mv.pad != 0) return false;
+    if (mv.trusted) { dx = static_cast<int>(mv.dx); dy = static_cast<int>(mv.dy); }
+    else { dx = 0; dy = 0; }
+    return true;
+}
+
+// Smooth (Tukey biweight) acceptance weight: continuous at the threshold, so a pixel drifting across the
+// noise limit fades in/out instead of toggling.
+__device__ inline float soft_accept(float diff, float limit) {
+    float t = fabsf(diff) / fmaxf(limit, 1e-8f);
+    if (t >= 1.0f) return 0.0f;
+    float u = 1.0f - t * t;
+    return u * u;
+}
+
 __device__ inline float eval_tonal_curve(const GpuKernelConfig& cfg, float luma) {
     float t = fminf(1.0f, fmaxf(0.0f, luma)) * 4.0f;
     int idx = min(3, max(0, static_cast<int>(t)));
@@ -216,8 +236,7 @@ __device__ inline float eval_tonal_curve(const GpuKernelConfig& cfg, float luma)
 
 __device__ inline float eval_channel_sigma(const GpuKernelConfig& cfg, int c, float val, float luma) {
     float var = fmaxf(1e-8f, cfg.nlf_a[c] * fmaxf(0.0f, val) + cfg.nlf_b[c]);
-    float chroma_mult = (c == 0) ? cfg.chroma_scale_cr : (c == 2) ? cfg.chroma_scale_cb : 1.0f;
-    return sqrtf(var) * cfg.spatial_weight * eval_tonal_curve(cfg, luma) * chroma_mult;
+    return sqrtf(var) * cfg.spatial_weight * eval_tonal_curve(cfg, luma) * cfg.channel_amount[c];
 }
 
 __device__ inline int freq_band_for_uv(int u, int v) {
@@ -343,7 +362,7 @@ __global__ void k_estimate_motion_luma(
     }
 
     if (d_scene_cut[f] != 0) {
-        if (lane == 0) d_mv_raw[mv_idx] = {0, 0, 0, 0};
+        if (lane == 0) d_mv_raw[mv_idx] = {0, 0, 0, 1};
         return;
     }
 
@@ -490,6 +509,7 @@ __global__ void k_smooth_motion_vectors(
     }
 
     GpuMotionVec center = d_mv_raw[idx];
+    if (center.pad != 0) { d_mv_smooth[idx] = {0, 0, 0, 1}; return; }
     int16_t vx[9];
     int16_t vy[9];
     int count = 0;
@@ -606,9 +626,10 @@ __global__ void k_bm3d_stage1_hard(
             }
             __syncthreads();
 
-            if (s_mv.trusted) {
-                int cx = min(max(0, bx + static_cast<int>(s_mv.dx)), max(0, cfg.width - 8));
-                int cy = min(max(0, by + static_cast<int>(s_mv.dy)), max(0, cfg.height - 8));
+            int mdx = 0, mdy = 0;
+            if (resolve_motion(s_mv, mdx, mdy)) {
+                int cx = min(max(0, bx + mdx), max(0, cfg.width - 8));
+                int cy = min(max(0, by + mdy), max(0, cfg.height - 8));
                 int cpx = min(cx + tx, cfg.width - 1);
                 int cpy = min(cy + ty, cfg.height - 1);
 
@@ -883,9 +904,10 @@ __global__ void k_bm3d_stage2_wiener(
             }
             __syncthreads();
 
-            if (s_mv.trusted) {
-                int cx = min(max(0, bx + static_cast<int>(s_mv.dx)), max(0, cfg.width - 8));
-                int cy = min(max(0, by + static_cast<int>(s_mv.dy)), max(0, cfg.height - 8));
+            int mdx = 0, mdy = 0;
+            if (resolve_motion(s_mv, mdx, mdy)) {
+                int cx = min(max(0, bx + mdx), max(0, cfg.width - 8));
+                int cy = min(max(0, by + mdy), max(0, cfg.height - 8));
                 int cpx = min(cx + tx, cfg.width - 1);
                 int cpy = min(cy + ty, cfg.height - 1);
 
@@ -1151,10 +1173,11 @@ __global__ void k_temporal_motion_average(
         for (int f = 0; f < cfg.frame_count; ++f) {
             if (f == cfg.ref_index) continue;
             GpuMotionVec mv = d_mv_smooth[(f * cfg.num_by + mv_by) * cfg.num_bx + mv_bx];
-            if (!mv.trusted) continue;
+            int mdx = 0, mdy = 0;
+            if (!resolve_motion(mv, mdx, mdy)) continue;
 
-            int cx = min(cfg.width - 1, max(0, x + static_cast<int>(mv.dx)));
-            int cy = min(cfg.height - 1, max(0, y + static_cast<int>(mv.dy)));
+            int cx = min(cfg.width - 1, max(0, x + mdx));
+            int cy = min(cfg.height - 1, max(0, y + mdy));
             int cidx = cy * cfg.stride_floats + cx * cfg.channels;
             float gcorr = d_gain_corr[f];
 
@@ -1162,9 +1185,12 @@ __global__ void k_temporal_motion_average(
             float cg = d_frames[f][cidx + 1] * gcorr;
             float cb = d_frames[f][cidx + 2] * gcorr;
 
-            if (fabsf(rr - cr) <= lim_r) { sr += cr; wr += 1.0f; }
-            if (fabsf(rg - cg) <= lim_g) { sg += cg; wg += 1.0f; }
-            if (fabsf(rb - cb) <= lim_b) { sb += cb; wb += 1.0f; }
+            float w_r = soft_accept(rr - cr, lim_r);
+            float w_g = soft_accept(rg - cg, lim_g);
+            float w_b = soft_accept(rb - cb, lim_b);
+            sr += w_r * cr; wr += w_r;
+            sg += w_g * cg; wg += w_g;
+            sb += w_b * cb; wb += w_b;
         }
     }
 
@@ -1591,20 +1617,25 @@ bool cuda_denoise_device(
     cfg.detail_recovery = params.detail_recovery;
     cfg.grain_amount = params.grain_amount;
     cfg.mix_original = params.mix_original;
-    cfg.chroma_scale_cb = params.chroma_scale_cb;
-    cfg.chroma_scale_cr = params.chroma_scale_cr;
+    {
+        const auto amounts = colorspace::ycc_amounts_to_rgb(params.luma_scale, params.chroma_scale_cb, params.chroma_scale_cr);
+        for (int c = 0; c < 3; ++c) cfg.channel_amount[c] = amounts[static_cast<size_t>(c)];
+    }
     cfg.preview_mode = params.preview_mode;
     cfg.force_opaque_alpha = params.force_opaque_alpha;
     for (int b = 0; b < 5; ++b) {
         cfg.band_weights[b] = params.band_weights[b];
         cfg.tonal_lut[b] = params.tonal_lut[b];
         for (int c = 0; c < 3; ++c) {
-            cfg.psd_weights[c][b] = params.psd_weights[c][b];
+            cfg.psd_weights[c][b] = params.psd_weights[0][b]; // spectral shape measured on luma, shared by R/G/B
         }
     }
-    for (int c = 0; c < 3; ++c) {
-        cfg.nlf_a[c] = params.nlf_a[c];
-        cfg.nlf_b[c] = params.nlf_b[c];
+    {
+        // Callers supply the profile in the Y/Cb/Cr working space; the GPU kernels filter RGB directly.
+        std::array<NoiseLevelFunction, 3> ycc{};
+        for (int c = 0; c < 3; ++c) { ycc[static_cast<size_t>(c)].a = params.nlf_a[c]; ycc[static_cast<size_t>(c)].b = params.nlf_b[c]; }
+        const auto rgb = colorspace::ycc_nlf_to_rgb(ycc);
+        for (int c = 0; c < 3; ++c) { cfg.nlf_a[c] = rgb[static_cast<size_t>(c)].a; cfg.nlf_b[c] = rgb[static_cast<size_t>(c)].b; }
     }
 
     dim3 block_2d(16, 16);

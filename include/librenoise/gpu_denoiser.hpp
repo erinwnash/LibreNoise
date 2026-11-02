@@ -23,11 +23,14 @@ struct CudaDenoiseParams {
         {1.0f, 1.0f, 1.0f, 1.0f, 1.0f}
     };
     float tonal_lut[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    // nlf_a/nlf_b/psd_weights are expressed in the Y/Cb/Cr working space (as produced by NoiseProfiler);
+    // cuda_denoise_device converts them to per-RGB-channel levels internally.
     float nlf_a[3] = {0.001f, 0.001f, 0.001f};
     float nlf_b[3] = {0.0001f, 0.0001f, 0.0001f};
     float detail_recovery = 0.15f;
     float grain_amount = 0.0f;
     float mix_original = 0.0f; // 0.0 = 100% denoised, 1.0 = 100% original
+    float luma_scale = 1.0f;       // Luma (Y) noise-reduction amount
     float chroma_scale_cb = 1.0f;
     float chroma_scale_cr = 1.0f;
     int32_t preview_mode = 0; // 0 = denoised, 1 = residual

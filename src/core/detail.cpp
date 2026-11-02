@@ -69,7 +69,7 @@ void DetailEngine::restore_details(
                 float grad_mag = std::sqrt(grad_sq);
                 float capped_res = std::clamp(residual, -1.5f * sigma, 1.5f * sigma);
                 float boost = std::clamp(recovery_strength * (grad_mag / (grad_mag + 2.0f * sigma)), 0.0f, 0.5f);
-                dst_row[x] = std::max(0.0f, den_val + boost * capped_res);
+                dst_row[x] = den_val + boost * capped_res;
             }
         }
     }
@@ -79,7 +79,8 @@ void DetailEngine::inject_calibrated_grain(
     ImagePlane32F& plane,
     const NoiseLevelFunction& nlf,
     float grain_amount,
-    uint32_t seed
+    uint32_t seed,
+    const ImagePlane32F* guide
 ) {
     if (grain_amount <= 0.001f) return;
 
@@ -92,9 +93,9 @@ void DetailEngine::inject_calibrated_grain(
         float* row = &plane.at(0, y);
         for (int32_t x = 0; x < w; ++x) {
             float val = row[x];
-            float sigma = nlf.sigma_at(val);
+            float sigma = nlf.sigma_at(guide ? guide->at(x, y) : val);
             float noise_sample = hash_gaussian_cpu(static_cast<uint32_t>(x), static_cast<uint32_t>(y), seed) * sigma * grain_amount;
-            row[x] = std::max(0.0f, val + noise_sample);
+            row[x] = val + noise_sample;
         }
     }
 }

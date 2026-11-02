@@ -46,6 +46,11 @@ const OfxInteractSuiteV1* g_interactSuite = nullptr;
 
 namespace {
 
+// Tooltip helper (shown by the host when hovering a parameter)
+void set_hint(OfxPropertySetHandle props, const char* text) {
+    g_propSuite->propSetString(props, kOfxParamPropHint, 0, text);
+}
+
 // Parameter Group Names
 constexpr const char* kGroupProfile           = "groupProfile";
 constexpr const char* kGroupDenoise           = "groupDenoise";
@@ -75,6 +80,7 @@ constexpr const char* kParamQualityPreset      = "qualityPreset";
 constexpr const char* kParamTemporalRadius     = "temporalRadius";
 constexpr const char* kParamTemporalStrength   = "temporalStrength";
 constexpr const char* kParamSpatialStrength    = "spatialStrength";
+constexpr const char* kParamLumaScale          = "lumaScale";
 constexpr const char* kParamChromaCr           = "chromaCr";
 constexpr const char* kParamChromaCb           = "chromaCb";
 constexpr const char* kParamMixWithOriginal     = "mixWithOriginal";
@@ -330,10 +336,12 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 1: Noise Profile & Analysis
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupProfile, &pProps);
+    set_hint(pProps, "Teach the denoiser what the noise in this clip looks like. A good profile matters more than any slider below.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Noise Profile & Analysis");
 
     // Analysis Box: Double2D Corner 1 and Corner 2
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble2D, kParamAnalysisBoxCorner1, &pProps);
+    set_hint(pProps, "Top-left corner of the noise sample area. Place the box on a flat, featureless region (sky, wall, out-of-focus background).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Region Top-Left");
     g_propSuite->propSetString(pProps, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypeXYAbsolute);
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
@@ -341,6 +349,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 1, 100.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble2D, kParamAnalysisBoxCorner2, &pProps);
+    set_hint(pProps, "Bottom-right corner of the noise sample area. The box should contain no edges or texture.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Region Bottom-Right");
     g_propSuite->propSetString(pProps, kOfxParamPropDoubleType, 0, kOfxParamDoubleTypeXYAbsolute);
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
@@ -349,38 +358,45 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Auto Profile Button
     g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamAutoProfile, &pProps);
+    set_hint(pProps, "Analyse the current frame, automatically find flat areas and build the noise profile. Quickest way to start.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Auto Profile (Search & Analyze)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
 
     // Auto Detect Area Button
     g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamAutoDetectArea, &pProps);
+    set_hint(pProps, "Search the frame for the flattest, most noise-only region and move the sample box there.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Auto Detect Area");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
 
     // Build Profile from Selection
     g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamBuildProfile, &pProps);
+    set_hint(pProps, "Measure noise inside the sample box and store it as this clip's noise profile (Luma, Cb and Cr measured separately).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Build Profile from Selection");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
 
     // Quality Meter (Read-only string readout)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileQuality, &pProps);
+    set_hint(pProps, "How reliable the current profile looks (based on how flat the sampled area was).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Profile Quality");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
     g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Uncalibrated");
 
     // Profile Assessment
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileAssessment, &pProps);
+    set_hint(pProps, "Plain-language verdict on the profile quality and what to do if it is poor.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Assessment");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
     g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Click Auto Profile or drag box on viewer");
 
     // Device & Mode Metadata
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileDevice, &pProps);
+    set_hint(pProps, "Optional label for the camera / sensor this profile belongs to (saved with the .lnp file).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Camera / Device");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
     g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Generic Digital Camera");
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfileMode, &pProps);
+    set_hint(pProps, "Optional label for the ISO / shooting mode this profile was made for (saved with the .lnp file).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Mode Description");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
     g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, "Standard ISO Profile");
@@ -388,15 +404,18 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Profile File Path & Load / Save
     std::string defaultProfilePath = librenoise::ProfileSerializer::get_default_profiles_directory() + "/profile.lnp";
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeString, kParamProfilePath, &pProps);
+    set_hint(pProps, "Location of the .lnp noise-profile file used by the Load / Save buttons.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Profile File (.lnp)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
     g_propSuite->propSetString(pProps, kOfxParamPropDefault, 0, defaultProfilePath.c_str());
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamLoadProfile, &pProps);
+    set_hint(pProps, "Load a saved noise profile (.lnp) from the Profile File path and apply it to this clip.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Load Profile (.lnp)...");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypePushButton, kParamSaveProfile, &pProps);
+    set_hint(pProps, "Save the current noise profile, band and tonal settings to the Profile File path for reuse on matching footage.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Save Profile (.lnp)...");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupProfile);
 
@@ -404,10 +423,12 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 2: Denoise Controls
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupDenoise, &pProps);
+    set_hint(pProps, "Main noise reduction controls.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Denoise Controls");
 
     // Engine Choice
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamDenoiseEngine, &pProps);
+    set_hint(pProps, "Algorithm used to remove noise. 3D Collaborative: best quality. Wavelet: fastest. Non-Local Means: good on repetitive texture. Frequency-Domain 3D: good on banding and chroma blotches.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Denoise Engine");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "3D Collaborative Transform (Highest Fidelity)");
@@ -418,6 +439,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Hardware Acceleration Mode (Track B)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamAccelerationMode, &pProps);
+    set_hint(pProps, "Auto uses the GPU (CUDA) when available and falls back to CPU. Force CPU is slower but is the reference-quality path.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Hardware Acceleration");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Auto (GPU if available, CPU fallback)");
@@ -427,6 +449,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Quality Preset (Track A)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamQualityPreset, &pProps);
+    set_hint(pProps, "Speed / quality trade-off. Fast for scrubbing, Balanced for grading, High Quality for final renders (slowest, most thorough).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Quality Preset");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Fast (Scrubbing / Realtime)");
@@ -436,6 +459,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Temporal Radius (Integer 0 to 4)
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeInteger, kParamTemporalRadius, &pProps);
+    set_hint(pProps, "Number of neighbouring frames on each side used to average noise over time. 0 = spatial only. Higher removes more noise on static areas but costs time and can ghost on fast motion.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Radius");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 2);
@@ -444,6 +468,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Temporal Strength
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTemporalStrength, &pProps);
+    set_hint(pProps, "How strongly frames are blended over time. 1.0 = standard; lower reduces ghosting/trails on moving subjects; higher cleans static areas harder.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Temporal Strength");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
@@ -452,22 +477,34 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Spatial Strength
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamSpatialStrength, &pProps);
+    set_hint(pProps, "Master amount of spatial (within-frame) noise reduction applied to Luma and Chroma together. 1.0 = remove exactly the profiled noise; raise if noise remains, lower to keep more texture.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Spatial Strength");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 2.0);
 
+    // Luminance (brightness) noise reduction amount
+    g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamLumaScale, &pProps);
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Luma (Y) Amount");
+    g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
+    g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
+    set_hint(pProps, "Noise reduction amount for brightness (Luma / Y) noise. Raise to remove more grain/speckle; lower to keep fine detail and a film-like texture. Multiplies the Spatial Strength.");
+
     // Chrominance Scaling
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamChromaCr, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cr Scale");
+    set_hint(pProps, "Noise reduction amount for red-vs-green colour noise (Cr). Raise to remove red/cyan colour speckle; colour noise can usually be pushed much harder than Luma.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cr (Red-Green) Amount");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamChromaCb, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cb Scale");
+    set_hint(pProps, "Noise reduction amount for blue-vs-yellow colour noise (Cb). Raise to remove blue/yellow colour speckle and blotches.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Chroma Cb (Blue-Yellow) Amount");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
@@ -475,6 +512,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
 
     // Mix With Original
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamMixWithOriginal, &pProps);
+    set_hint(pProps, "Blend some of the original (noisy) image back in. 0 = fully denoised, 1 = original. Useful to restore natural texture.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Mix with Original");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDenoise);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.0);
@@ -485,38 +523,44 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 3: Frequency Equalizer
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupFrequency, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Frequency Equalizer");
+    set_hint(pProps, "Choose how hard to filter noise at each spatial size. Very Low = large soft blotches; Very High = finest pixel-level grain. 1.0 on every slider removes exactly the measured noise.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Frequency Equalizer (noise size)");
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryLow, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very Low");
+    set_hint(pProps, "Noise at the coarsest scale: large, soft colour/brightness blotches (about 8+ pixels across). Raise to remove blotchy low-frequency noise (risk: flattens gradients). 1.0 = as measured, 0 = leave untouched.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Freq: Very Low (large blotches)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandLow, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Low");
+    set_hint(pProps, "Noise at a coarse scale (about 4-8 pixels): soft mottling and compression blotching. Raise to smooth mottling; lower to protect broad detail.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Freq: Low (mottling)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandMid, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Mid");
+    set_hint(pProps, "Noise at a medium scale (about 2-4 pixels): the bulk of typical sensor / film grain. The most important band: raise to remove more grain.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Freq: Mid (main grain)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandHigh, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: High");
+    set_hint(pProps, "Noise at a fine scale (about 1.5-2 pixels): crisp grain that overlaps fine detail. Raise to clean it; lower to keep sharpness and texture.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Freq: High (fine grain)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamBandVeryHigh, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Band: Very High");
+    set_hint(pProps, "Noise at the finest scale (single pixels): pixel-level speckle. Raise to remove speckle; also affects the sharpest image detail.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Freq: Very High (pixel speckle)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupFrequency);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.0);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMin, 0, 0.0);
@@ -526,9 +570,11 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 4: Tonal Equalizer
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupTonal, &pProps);
-    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal Equalizer");
+    set_hint(pProps, "Choose how hard to filter noise in different brightness ranges. Noise is usually strongest in shadows, so shadows default higher than highlights.");
+    g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal Equalizer (brightness)");
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalShadows, &pProps);
+    set_hint(pProps, "Noise reduction multiplier in the darkest tones (0-20% brightness). Raise to clean noisy shadows.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Shadows (0-20%)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.30);
@@ -536,6 +582,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalDarkMid, &pProps);
+    set_hint(pProps, "Noise reduction multiplier in dark midtones (20-40% brightness).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Dark Midtones (20-40%)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.15);
@@ -543,6 +590,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalMidtones, &pProps);
+    set_hint(pProps, "Noise reduction multiplier in midtones (40-60% brightness).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Midtones (40-60%)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 1.00);
@@ -550,6 +598,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalLightMid, &pProps);
+    set_hint(pProps, "Noise reduction multiplier in light midtones (60-80% brightness).");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Light Midtones (60-80%)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.90);
@@ -557,6 +606,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 3.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamTonalHighlights, &pProps);
+    set_hint(pProps, "Noise reduction multiplier in the brightest tones (80-100% brightness). Keep low to preserve highlight detail.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Tonal: Highlights (80-100%)");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupTonal);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.80);
@@ -567,9 +617,11 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 5: Detail & Grain Recovery
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupDetail, &pProps);
+    set_hint(pProps, "Put back fine detail and natural grain after denoising.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Detail & Grain Recovery");
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamDetailRecovery, &pProps);
+    set_hint(pProps, "Recovers fine detail the filter removed along with the noise (edges, texture) without bringing the noise back. 0 = off.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Detail Recovery");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.15);
@@ -577,6 +629,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 1.0);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeDouble, kParamGrainAmount, &pProps);
+    set_hint(pProps, "Add fresh, uniform film-like grain after denoising so heavy cleaning does not look plastic. 0 = none.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Grain Amount");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetDouble(pProps, kOfxParamPropDefault, 0, 0.0);
@@ -584,6 +637,7 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     g_propSuite->propSetDouble(pProps, kOfxParamPropDisplayMax, 0, 0.5);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeChoice, kParamPreviewMode, &pProps);
+    set_hint(pProps, "Denoised Output shows the result. Residual shows only what was removed: it should look like pure noise with no picture structure; visible edges mean detail is being damaged.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Preview Mode");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupDetail);
     g_propSuite->propSetString(pProps, kOfxParamPropChoiceOption, 0, "Denoised Output");
@@ -594,19 +648,23 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     // Group 6: Performance & Optimizations
     // =========================================================================
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeGroup, kGroupPerformance, &pProps);
+    set_hint(pProps, "Speed optimisations. Leave on unless troubleshooting.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Performance & Optimizations");
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastChroma, &pProps);
+    set_hint(pProps, "Filter colour channels at reduced density. Faster with little visible loss since colour noise is smooth.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Chroma Subsampling");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamFastDct, &pProps);
+    set_hint(pProps, "Use the optimised butterfly transform on the CPU. Same result, faster.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Fast Butterfly DCT");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
 
     g_paramSuite->paramDefine(paramSet, kOfxParamTypeBoolean, kParamEarlyExitMotion, &pProps);
+    set_hint(pProps, "Stop motion searching early when a match is already good enough. Faster; disable only if motion tracking looks wrong.");
     g_propSuite->propSetString(pProps, kOfxPropLabel, 0, "Early-Exit Motion Check");
     g_propSuite->propSetString(pProps, kOfxParamPropParent, 0, kGroupPerformance);
     g_propSuite->propSetInt(pProps, kOfxParamPropDefault, 0, 1);
@@ -997,6 +1055,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     int radius = 2;
     double tempStrength = 1.0;
     double spatStrength = 1.0;
+    double lumaScale = 1.0;
     double chromaCr = 1.0;
     double chromaCb = 1.0;
     double mixWithOriginal = 0.0;
@@ -1027,6 +1086,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalRadius, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &radius);
         if (g_paramSuite->paramGetHandle(paramSet, kParamTemporalStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &tempStrength);
         if (g_paramSuite->paramGetHandle(paramSet, kParamSpatialStrength, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &spatStrength);
+        if (g_paramSuite->paramGetHandle(paramSet, kParamLumaScale, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &lumaScale);
         if (g_paramSuite->paramGetHandle(paramSet, kParamChromaCr, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &chromaCr);
         if (g_paramSuite->paramGetHandle(paramSet, kParamChromaCb, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &chromaCb);
         if (g_paramSuite->paramGetHandle(paramSet, kParamMixWithOriginal, &p, nullptr) == kOfxStatOK) g_paramSuite->paramGetValueAtTime(p, renderTime, &mixWithOriginal);
@@ -1214,6 +1274,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
         cp.detail_recovery = static_cast<float>(detailRec);
         cp.grain_amount = static_cast<float>(grainAmt);
         cp.mix_original = static_cast<float>(mixWithOriginal);
+        cp.luma_scale = static_cast<float>(lumaScale);
         cp.chroma_scale_cr = static_cast<float>(chromaCr);
         cp.chroma_scale_cb = static_cast<float>(chromaCb);
         cp.preview_mode = previewMode;
@@ -1459,6 +1520,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
     config.filter_params.early_exit_motion = (earlyExitMotion != 0);
     config.filter_params.temporal_weight = static_cast<float>(tempStrength);
     config.filter_params.spatial_weight = static_cast<float>(spatStrength);
+    config.filter_params.luma_scale = static_cast<float>(lumaScale);
     config.filter_params.chroma_scale_cr = static_cast<float>(chromaCr);
     config.filter_params.chroma_scale_cb = static_cast<float>(chromaCb);
     config.filter_params.abort_fn = &ofx_abort_trampoline;

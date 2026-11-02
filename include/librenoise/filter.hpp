@@ -30,12 +30,19 @@ struct FilterParams {
     bool fast_chroma = true;         // Subsample chroma patch evaluations by 2x
     bool early_exit_motion = true;   // Terminate block matching early when error < noise floor
 
-    // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High]
+    // Per-Band Strengths [0: Very Low, 1: Low, 2: Mid, 3: High, 4: Very High].
+    // Each value multiplies the noise threshold used for that spatial-frequency band on top of the
+    // measured profile PSD: 1.0 = remove exactly the measured noise, >1 removes more, <1 keeps more.
     std::array<float, 5> band_weights{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::array<float, 5> tonal_lut{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    // Noise reduction amount per working-space channel (the filter operates in Y/Cb/Cr).
+    float luma_scale = 1.0f;
     float chroma_scale_cb = 1.0f;
     float chroma_scale_cr = 1.0f;
-    int32_t channel_index = 0;
+    int32_t channel_index = 0;   // 0 = Y, 1 = Cb, 2 = Cr (set by the dispatcher)
+    // Luma plane of the reference frame. Chroma planes look their noise level up against luma
+    // intensity (shot noise depends on brightness, not on colour-difference value).
+    const ImagePlane32F* luma_guide = nullptr;
 
     // Collaborative 3D Parameters
     int32_t patch_size = 8;

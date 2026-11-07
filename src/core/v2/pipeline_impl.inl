@@ -19,6 +19,7 @@
 //   template<class F> void for2d(int w, int h, F f)       f(x, y)
 //   template<class F> double sum2d(int w, int h, F f)     sum of f(x, y)
 //   bool aborted()
+//   void mark(const char*)   optional stage timing (LIBRENOISE_TIMING=1)
 
 #include "kernels.hpp"
 #include <cmath>
@@ -217,7 +218,7 @@ double temporal_accumulate(B& be, int w, int h, const float* refY, const float* 
     be.for2d(w, h, LN_LAMBDA(int x, int y) {
         const size_t i = static_cast<size_t>(y) * w + x;
         const float e = dm[i] * inv_e;
-        float wt = (tol <= 0.0f) ? 0.0f : expf(-fmaxf(0.0f, e - knee) / soft);
+        float wt = (tol <= 0.0f) ? 0.0f : k::fast_exp(-fmaxf(0.0f, e - knee) / soft);
         a0[i] += wt * w0[i];
         a1[i] += wt * w1[i];
         a2[i] += wt * w2[i];
@@ -303,6 +304,7 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
     auto rY = be.alloc(N), rCb = be.alloc(N), rCr = be.alloc(N), scratch = be.alloc(N);
     convert_frame(be, frames[ref], w, h, L, rY.p, rCb.p, rCr.p, scratch.p, db);
     if (be.aborted()) return false;
+    be.mark("convert ref");
 
     auto acc0 = be.alloc(N), acc1 = be.alloc(N), acc2 = be.alloc(N), wsum = be.alloc(N), w2sum = be.alloc(N);
     be.copy(acc0.p, rY.p, N);
@@ -337,16 +339,19 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
                     if (dup) continue;
                 }
                 convert_frame(be, frames[kidx], w, h, L, kY.p, kCb.p, kCr.p, scratch.p, db);
+                be.mark("  convert");
                 MotionPyr<B> kpyr;
                 build_motion_pyr(be, kY.p, w, h, kpyr);
                 estimate_motion(be, rpyr, kpyr, have_prev ? vprev.p : nullptr,
                                 static_cast<float>(d) / static_cast<float>(std::max(1, d - 1)), vcur.p);
+                be.mark("  motion");
                 const float* cand[3] = {kY.p, kCb.p, kCr.p};
                 float* Wp[3] = {W0.p, W1.p, W2.p};
                 float* ap[3] = {acc0.p, acc1.p, acc2.p};
                 const double mean_w = temporal_accumulate(be, w, h, rY.p, cand, vcur.p, Wp, dd.p, scratch.p, t2.p, ap,
                                                           wsum.p, w2sum.p, M.pixel_sigma[0], P.temporal_strength,
                                                           P.flicker_reduction);
+                be.mark("  accumulate");
                 std::swap(vprev, vcur);
                 have_prev = true;
                 if (mean_w < 0.08) break;   // scene cut or unusable frame: stop on this side
@@ -354,6 +359,8 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
         }
     }
     if (be.aborted()) return false;
+
+    be.mark("temporal");
 
     // Normalise the temporal estimate and build the per-pixel threshold factor F0 = rho * tonal.
     auto F0 = be.alloc(N);
@@ -377,6 +384,7 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
         box_blur(be, F0.p, F0.p, scratch.p, w, h, 3);
     }
     rY = typename B::Buf(); rCb = typename B::Buf(); rCr = typename B::Buf();
+    be.mark("normalise+factor");
     wsum = typename B::Buf(); w2sum = typename B::Buf();
 
     // Factor pyramid
@@ -401,6 +409,7 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
                 sig_host[(static_cast<size_t>(l) * 3 + c) * kCoefs + q] =
                     M.level_sigma[l][c][q] * P.noise_level[l] * P.channel_noise_level[c];
     auto sig_dev = be.upload(sig_host.data(), sig_host.size());
+    be.mark("factor pyramid");
 
     // Spatial multi-scale filter, one channel at a time
     float* chans[3] = {acc0.p, acc1.p, acc2.p};
@@ -460,6 +469,7 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
     if (be.aborted()) return false;
 
     // Output
+    be.mark("spatial");
     {
         const float* a0 = acc0.p; const float* a1 = acc1.p; const float* a2 = acc2.p;
         const float* rd = frames[ref].data;
@@ -492,6 +502,7 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
             if (och >= 4) o[3] = (ich >= 4) ? p[3] : 1.0f;
         });
     }
+    be.mark("output");
     return true;
 }
 

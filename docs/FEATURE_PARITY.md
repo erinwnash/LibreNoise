@@ -1,93 +1,80 @@
 # LibreNoise: Feature Parity
 
-Source: `docs/reference/` (sections 1.2, 5.5-5.8, 6, 7, 8, 10). Compared against the current tree.
+Source: `docs/reference/` (sections 1.2, 5.5-5.8, 6, 7, 8, 10). Compared against v0.2.
 Legend: **Have** = implemented, **Partial** = exists but weaker or differently shaped, **Missing** = not implemented.
 
 ## Profiling
 
 | Feature | Status | Notes |
 |---|---|---|
-| Auto Profile | Have | `NoiseProfiler::auto_estimate`, stratified flat-patch search |
-| Semi-automatic (draw box, Build Profile) | Have | Analysis box + Build Profile in OFX |
-| Auto-detect featureless area | Have | `RoiAnalyzer`, quality score and assessment string |
-| Manual Fine-Tune / Auto Complete (add samples from other brightness ranges) | **Missing** | Only one sample region per profile. Biggest profiling gap. |
-| Generic Profile + "Generic Noise" slider (no clean area needed) | **Missing** | No fallback when a frame has no flat area except fixed defaults |
-| Save / load device profile (.dnp) | Have | `.lnp` format, device and mode labels |
-| Profile-quality warnings about the selected area | Partial | Quality score and assessment text; no per-problem warnings (too dark, too small, contains detail) |
-| Per-channel Y / Cb / Cr noise levels | Have | Profile is now measured in the same Y/Cb/Cr space the filters use |
-| Per-frequency noise spectrum | Have | 5-band DCT PSD measured |
-| Input gamma / gain override | **Missing** | Noise model assumes linear or already-consistent data; no gain pre-adjust |
-| Progressive / interlaced scan type | **Missing** | No field-aware processing |
-| Default profile and preset in Preferences | **Missing** | |
+| Auto Profile | Have | Whole-frame brightness curve + spectrum from the flattest areas, measured once per clip |
+| Semi-automatic (draw box, Build Profile) | Have | Build Profile from Box measures the spectrum inside the box; the curve is still whole-frame |
+| Noise level across brightness (Fine-Tune / Auto Complete) | Have (different) | Measured automatically over the whole frame as a curve, so no manual Fine-Tune pass is needed |
+| Generic Profile (no clean area needed) | Partial | Auto mode pools many small flat areas; a frame with no flat area at all still gives a weak profile (quality shown) |
+| Save / load device profile | Have | `.lnp` v2 (text), device and mode labels |
+| Profile-quality warnings | Partial | Quality %, plain-language assessment; no per-problem warnings yet |
+| Per-channel Y / Cr / Cb noise levels | Have | Per-channel, per-scale, per-DCT-coefficient table |
+| Per-frequency noise spectrum | Have | Full 2D spectrum per channel |
+| Input gamma / gain | Have (different) | Not needed: the measured curve adapts to any transfer function (linear, log, display) |
+| Source type (film / digital / compressed) | Have (extra) | Auto-detected with manual override |
+| Progressive / interlaced scan type | **Missing** | |
 
 ## Temporal filter
 
 | Feature | Status | Notes |
 |---|---|---|
-| Radius (frames each side) | Have | 0-4 |
-| Quality Mode Normal / High | Have | Quality Preset (Fast / Balanced / High) |
-| Temporal noise level | Partial | "Temporal Strength" scales the match threshold; not separate from spatial Noise Level |
-| Flicker reduction (local and frame) | **Missing** | Only exposure-drift compensation inside motion matching, no flicker control |
-| Repeated frames (Repeat Rate) | **Missing** | Duplicate frames from FPS conversion are treated as independent samples, so noise averages less than it should |
-| Jitter of details ("heat haze") | **Missing** | |
-| Dust and scratches (Normal / Aggressive) | **Missing** | |
-| Adapt to changing noise | **Missing** | Profile is fixed, or re-estimated per frame when none is built |
-| Motion compensation, scene-cut handling | Have | Block matching with trust map, cut detection |
+| Radius | Have | 0-5 frames each side, default 2 |
+| Quality Mode Normal / High | Partial | Quality preset changes spatial overlap; motion search is fixed |
+| Temporal noise level | Have | Temporal Strength |
+| Flicker reduction | Have | Flicker Reduction (local, slow brightness changes) |
+| Repeated frames | Have (automatic) | Exact duplicates are detected and skipped |
+| Motion compensation, scene-cut handling | Have | Hierarchical half-pel block matching, scene-cut stop |
+| Jitter of details | **Missing** | |
+| Dust and scratches | **Missing** | |
+| Adapt to changing noise | **Missing** | Profile measured once per clip |
 
 ## Spatial filter
 
 | Feature | Status | Notes |
 |---|---|---|
-| Noise Reduction Amount, Luminance | **Have (new)** | Luma (Y) Amount added this session. It was missing before. |
-| Noise Reduction Amount, Cb and Cr | Have | |
-| Per-frequency amount (High / Mid / Low / Very Low / Ultra Low) | Partial | 5 bands exist, but they scale the noise threshold relative to the measured spectrum, applied to all channels together. |
-| Noise Level (threshold) separate from Amount | **Missing** | LibreNoise has one multiplier per band, no separate "what counts as noise" and "how much of it to remove" |
-| Tonal (brightness) equalizer | Have | 5 tonal bands. |
+| Noise Reduction Amount (Luminance, Cr, Cb) | Have | |
+| Noise Level (threshold) separate from Amount | Have | Master, per channel (Luma / Chroma) and per frequency |
+| Per-frequency amounts (High / Mid / Low / Very Low / Ultra Low) | Have | 5 pyramid levels; Amount = per channel x per frequency |
+| Tonal equaliser | Have (extra) | In stops around 18% grey; neutral by default |
+| Compression artifact reduction | Have | Grid detection + deblocking (Artifact Removal) |
 | Artifact Removal (dot / line residue) | **Missing** | |
 | Edge Smoothing | **Missing** | |
-| Filter Tuning Assist (exaggerate setting effect in preview) | **Missing** | Residual preview exists but is not an amplified-effect view |
-| Multiple engines | Have (extra) | Collaborative 3D, Wavelet, NLM, Frequency-Domain. |
+| Filter Tuning Assist | Partial | "Removed Noise" view |
 
 ## Sharpening and finishing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Smart sharpening (per frequency and channel) | **Missing** | "Detail Recovery" re-adds lost detail but is not a sharpener |
+| Sharpening | Have | Boosts denoised High/Mid levels only (no noise amplification); single amount |
 | Mix with Original | Have | |
-| Calibrated grain re-injection | Have (extra) | Not common in other tools |
+| Grain re-injection | Have (extra) | At the measured noise strength |
 
 ## UI and workflow
 
 | Feature | Status | Notes |
 |---|---|---|
-| Dedicated plug-in window with live zoom and pan preview | **Missing** | LibreNoise uses native host parameters plus a viewer overlay for the sample box |
-| Beginner / Advanced mode | **Missing** | All controls are always visible |
-| Variants A/B/C/D | **Missing** | |
-| Filter presets | Partial | Settings travel inside the `.lnp` profile only |
-| Click-to-compare original | Partial | Mix with Original and Residual preview; no click-to-toggle |
-| Viewer modes (YCrCb + enhanced contrast, channel views) | **Missing** | |
-| Global bypass | **Missing** | Use the host's effect bypass |
-| Tooltips | **Have (new)** | Every parameter has a hint as of this session |
+| Dedicated plug-in window | **Missing** | Native host parameters plus viewer box overlay |
+| Beginner / Advanced mode | Partial | Advanced groups (Frequencies, Tonal, Processing) start collapsed |
+| Variants, presets | **Missing** | Profile files only |
+| Tooltips | Have | Every parameter |
 
 ## Performance and platform
 
 | Feature | Status | Notes |
 |---|---|---|
-| CUDA | Have | sm_86+ only. |
+| CUDA | Have | sm_86+, same result as the CPU |
 | OpenCL (AMD) | **Missing** | |
 | Multi-GPU | **Missing** | |
-| Auto / manual device selection and Optimize Settings benchmark | **Missing** | Only Auto / Force GPU / Force CPU |
-| Fast vs full floating-point ("high-precision") | Partial | Always 32-bit float |
-| Preview cache and Preferences panel | **Missing** | |
-| Multiple hosts | Partial | OFX plus an After Effects plug-in |
+| CPU | Have | OpenMP + AVX2 |
 
-## Suggested priorities
+## Next priorities
 
-1. **Per-channel x per-frequency amounts** (the core advanced mode of professional tools), with a separate Noise Level threshold. This is the real answer to "what should the band sliders do".
-2. **Manual Fine-Tune / Auto Complete** profiling and a **Generic Profile** fallback. Weak profiles are the main reason noise survives.
-3. **Cache or smooth the auto-profile across frames.** With no built profile, every frame is re-estimated, so strength varies frame to frame (visible as flicker).
-4. **Flicker reduction** and **Repeated Frames**, the cheapest temporal wins.
-5. **Artifact Removal**, **Edge Smoothing**, **Sharpening**.
-6. **Dust and Scratches**, **Jitter of Details**, **Adapt to Changing Noise**.
-7. Presets / Variants, and an Advanced / Beginner split of the parameter list.
-8. Interlaced and gamma / gain input handling, OpenCL, lower CUDA compute floor.
+1. Tile the CPU spatial stage (memory bandwidth), cache motion between renders.
+2. Residual dot / line Artifact Removal and Edge Smoothing.
+3. Adapt to changing noise (re-measure on scene changes), dust and scratches.
+4. Presets / variants and a simpler beginner panel.

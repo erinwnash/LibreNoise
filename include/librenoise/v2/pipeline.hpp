@@ -33,6 +33,9 @@ NoiseModel estimate_noise_model(const FrameView& frame, int32_t width, int32_t h
 bool denoise_cpu(const FrameView* frames, int32_t n, int32_t ref, int32_t width, int32_t height,
                  const NoiseModel& model, const Params& params, const OutputView& out);
 
+// Frees cached working buffers (both back ends keep them between frames for speed).
+void release_cpu_buffers() noexcept;
+
 // CUDA path: frame data, the frames array itself and the output live in device memory.
 bool cuda_available() noexcept;
 void cuda_release() noexcept;

@@ -147,7 +147,7 @@ void estimate_motion(B& be, const MotionPyr<B>& R, const MotionPyr<B>& C, const 
         const int w3 = R.d.w[3], h3 = R.d.h[3], nb = nbx[3];
         float* v = vb[3].p;
         be.for2d(nbx[3], nby[3], LN_LAMBDA(int bx, int by) {
-            const k::Vec2 r = k::me_full(rp, cp, w3, h3, bx, by, 6);
+            const k::Vec2 r = k::me_full(rp, cp, w3, h3, bx, by, 6, 0.4f);
             v[(static_cast<size_t>(by) * nb + bx) * 2] = r.x;
             v[(static_cast<size_t>(by) * nb + bx) * 2 + 1] = r.y;
         });
@@ -161,6 +161,7 @@ void estimate_motion(B& be, const MotionPyr<B>& R, const MotionPyr<B>& C, const 
         const float ps = pred_scale;
         const int row_step = (l == 0) ? 2 : 1;
         const bool half = (l == 0);
+        const float lam = 3.0f / static_cast<float>(1 << l);   // cost per pixel of vector length (see me_full)
         be.for2d(nbx[l], nby[l], LN_LAMBDA(int bx, int by) {
             k::Vec2 c[7];
             int n = 0;
@@ -175,7 +176,7 @@ void estimate_motion(B& be, const MotionPyr<B>& R, const MotionPyr<B>& C, const 
                 const size_t qi = (static_cast<size_t>(by) * nb + bx) * 2;
                 c[n].x = pr[qi] * ps; c[n].y = pr[qi + 1] * ps; ++n;
             }
-            const k::Vec2 r = k::me_refine(rp, cp, wl, hl, bx, by, c, n, row_step, half);
+            const k::Vec2 r = k::me_refine(rp, cp, wl, hl, bx, by, c, n, row_step, half, lam);
             v[(static_cast<size_t>(by) * nb + bx) * 2] = r.x;
             v[(static_cast<size_t>(by) * nb + bx) * 2 + 1] = r.y;
         });
@@ -184,9 +185,10 @@ void estimate_motion(B& be, const MotionPyr<B>& R, const MotionPyr<B>& C, const 
 
 // Warps cand into W (3 planes) with the block vectors, computes weights, accumulates. Returns mean weight.
 template <class B>
-double temporal_accumulate(B& be, int w, int h, const float* refY, const float* const cand[3], const float* v0,
+double temporal_accumulate(B& be, int w, int h, const float* refY, const float* refCb, const float* refCr,
+                           const float* const cand[3], const float* v0,
                            float* W[3], float* dd, float* tmp, float* tmp2, float* acc[3], float* wsum, float* w2sum,
-                           float sigmaY, float strength, float flicker) {
+                           float sigmaY, float sigmaCb, float sigmaCr, float strength, float flicker) {
     const int nbx = (w + 7) / 8;
     const float* c0 = cand[0]; const float* c1 = cand[1]; const float* c2 = cand[2];
     float* w0 = W[0]; float* w1 = W[1]; float* w2 = W[2];
@@ -207,9 +209,20 @@ double temporal_accumulate(B& be, int w, int h, const float* refY, const float* 
             dd[i] -= fl * tmp2[i];
         });
     }
-    be.for2d(w, h, LN_LAMBDA(int x, int y) { const size_t i = static_cast<size_t>(y) * w + x; dd[i] = dd[i] * dd[i]; });
+    // Match distance over all three working channels, each normalised by its own noise level, so a candidate with the
+    // same brightness but a different colour (e.g. skin vs blue backdrop) is rejected too.
+    {
+        const float iy = 1.0f / (2.0f * sigmaY * sigmaY + 1e-9f);
+        const float icb = 1.0f / (2.0f * sigmaCb * sigmaCb + 1e-9f);
+        const float icr = 1.0f / (2.0f * sigmaCr * sigmaCr + 1e-9f);
+        be.for2d(w, h, LN_LAMBDA(int x, int y) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const float dcb = refCb[i] - w1[i], dcr = refCr[i] - w2[i];
+            dd[i] = dd[i] * dd[i] * iy + dcb * dcb * icb + dcr * dcr * icr;
+        });
+    }
     box_blur(be, dd, tmp2, tmp, w, h, 2);
-    const float inv_e = 1.0f / (2.0f * sigmaY * sigmaY + 1e-9f);
+    const float inv_e = 1.0f / 3.0f;
     const float tol = fmaxf(strength, 0.0f);
     const float knee = 1.0f + 0.8f * tol;
     const float soft = fmaxf(0.6f * tol, 1e-3f);
@@ -348,9 +361,9 @@ bool run_pipeline(B& be, const FrameView* frames, int n, int ref, int w, int h, 
                 const float* cand[3] = {kY.p, kCb.p, kCr.p};
                 float* Wp[3] = {W0.p, W1.p, W2.p};
                 float* ap[3] = {acc0.p, acc1.p, acc2.p};
-                const double mean_w = temporal_accumulate(be, w, h, rY.p, cand, vcur.p, Wp, dd.p, scratch.p, t2.p, ap,
-                                                          wsum.p, w2sum.p, M.pixel_sigma[0], P.temporal_strength,
-                                                          P.flicker_reduction);
+                const double mean_w = temporal_accumulate(be, w, h, rY.p, rCb.p, rCr.p, cand, vcur.p, Wp, dd.p, scratch.p, t2.p, ap,
+                                                          wsum.p, w2sum.p, M.pixel_sigma[0], M.pixel_sigma[1], M.pixel_sigma[2],
+                                                          P.temporal_strength, P.flicker_reduction);
                 be.mark("  accumulate");
                 std::swap(vprev, vcur);
                 have_prev = true;

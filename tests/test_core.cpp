@@ -228,6 +228,49 @@ int main() {
 #endif
     }
 
+    // -------------------------------------------------------------- temporal regressions seen on real footage
+    {
+        // 1. Motion search must not wander in flat areas: independent noise, no real motion.
+        const int N = 96;
+        std::vector<float> a(static_cast<size_t>(N) * N), b(a.size());
+        std::mt19937 rng(21);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (auto& v : a) v = nd(rng);
+        for (auto& v : b) v = nd(rng);
+        int far = 0, total = 0;
+        for (int by = 2; by < N / 8 - 2; ++by)
+            for (int bx = 2; bx < N / 8 - 2; ++bx) {
+                const k::Vec2 v = k::me_full(a.data(), b.data(), N, N, bx, by, 6, 3.0f);
+                ++total;
+                if (std::abs(v.x) + std::abs(v.y) > 4.0f) ++far;
+            }
+        check(far * 20 <= total, "motion search stays near zero in flat noise", std::to_string(far) + " of " + std::to_string(total) + " blocks far");
+
+        // 2. A neighbour with the same brightness but a different colour must not be blended in.
+        std::vector<float> clean_b = clean;
+        for (int y = 128; y < 192; ++y)
+            for (int x = 128; x < 192; ++x) {
+                float* p = &clean_b[(static_cast<size_t>(y) * W + x) * 4];
+                p[0] *= 1.43f;   // about +6 sigma in R and -6 sigma in G: luma unchanged, chroma very different
+                p[1] /= 1.43f;
+            }
+        std::vector<std::vector<float>> fr;
+        for (int i = 0; i < 5; ++i) fr.push_back(add_noise(i == 2 ? clean : clean_b, W, H, 0.06f, 0.0005f, 90 + i));
+        std::vector<FrameView> fv;
+        for (auto& f : fr) fv.push_back(FrameView{f.data(), W * 4, 4});
+        Params tp;
+        tp.temporal_radius = 2;
+        std::vector<float> outc(noisy.size());
+        denoise_cpu(fv.data(), 5, 2, W, H, model, tp, OutputView{outc.data(), W * 4, 4});
+        double ro = 0, rc = 0;
+        for (int y = 140; y < 180; ++y)
+            for (int x = 140; x < 180; ++x) {
+                ro += outc[(static_cast<size_t>(y) * W + x) * 4];
+                rc += clean[(static_cast<size_t>(y) * W + x) * 4];
+            }
+        check(std::abs(ro / rc - 1.0) < 0.04, "same-luma different-colour neighbours are rejected", "patch R ratio " + fmt(ro / rc));
+    }
+
     // -------------------------------------------------------------- digital sensor detection (channel-correlated noise)
     {
         std::mt19937 rng(9);

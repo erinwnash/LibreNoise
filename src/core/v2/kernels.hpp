@@ -433,14 +433,17 @@ LN_HD float block_sad_sub(const float* ref, const float* cand, int w, int h, int
 }
 
 // Full search at the coarsest level.
-LN_HD Vec2 me_full(const float* ref, const float* cand, int w, int h, int bxi, int byi, int radius) {
+// `lam` charges each pixel of vector length, so in flat areas (where every displacement matches equally well) the
+// search stays at zero instead of wandering to a random far-away match; real motion over texture gains far more
+// SAD than it costs.
+LN_HD Vec2 me_full(const float* ref, const float* cand, int w, int h, int bxi, int byi, int radius, float lam) {
     const int bx = bxi * 8, by = byi * 8;
     float best = block_sad(ref, cand, w, h, bx, by, 0, 0, 1) * 0.98f;
     int bdx = 0, bdy = 0;
     for (int dy = -radius; dy <= radius; ++dy)
         for (int dx = -radius; dx <= radius; ++dx) {
             if (dx == 0 && dy == 0) continue;
-            const float s = block_sad(ref, cand, w, h, bx, by, dx, dy, 1);
+            const float s = block_sad(ref, cand, w, h, bx, by, dx, dy, 1) + lam * static_cast<float>(abs(dx) + abs(dy));
             if (s < best) { best = s; bdx = dx; bdy = dy; }
         }
     Vec2 v; v.x = static_cast<float>(bdx); v.y = static_cast<float>(bdy);
@@ -449,14 +452,15 @@ LN_HD Vec2 me_full(const float* ref, const float* cand, int w, int h, int bxi, i
 
 // Predictive refinement: evaluate candidate vectors, refine the best by +/-1, optional half-pel step.
 LN_HD Vec2 me_refine(const float* ref, const float* cand, int w, int h, int bxi, int byi,
-                     const Vec2* cands, int ncand, int row_step, bool half_pel) {
+                     const Vec2* cands, int ncand, int row_step, bool half_pel, float lam) {
     const int bx = bxi * 8, by = byi * 8;
+    if (row_step == 2) lam *= 0.5f;            // the SAD only sums half of the rows
     float best = block_sad(ref, cand, w, h, bx, by, 0, 0, row_step) * 0.98f;
     int bdx = 0, bdy = 0;
     for (int c = 0; c < ncand; ++c) {
         const int dx = static_cast<int>(lrintf(cands[c].x)), dy = static_cast<int>(lrintf(cands[c].y));
         if (dx == bdx && dy == bdy) continue;
-        const float s = block_sad(ref, cand, w, h, bx, by, dx, dy, row_step);
+        const float s = block_sad(ref, cand, w, h, bx, by, dx, dy, row_step) + lam * static_cast<float>(abs(dx) + abs(dy));
         if (s < best) { best = s; bdx = dx; bdy = dy; }
     }
     for (int it = 0; it < 2; ++it) {
@@ -465,20 +469,21 @@ LN_HD Vec2 me_refine(const float* ref, const float* cand, int w, int h, int bxi,
         for (int dy = -1; dy <= 1; ++dy)
             for (int dx = -1; dx <= 1; ++dx) {
                 if (dx == 0 && dy == 0) continue;
-                const float s = block_sad(ref, cand, w, h, bx, by, cx + dx, cy + dy, row_step);
+                const float s = block_sad(ref, cand, w, h, bx, by, cx + dx, cy + dy, row_step) +
+                                lam * static_cast<float>(abs(cx + dx) + abs(cy + dy));
                 if (s < best) { best = s; bdx = cx + dx; bdy = cy + dy; moved = true; }
             }
         if (!moved) break;
     }
     Vec2 v; v.x = static_cast<float>(bdx); v.y = static_cast<float>(bdy);
     if (half_pel) {
-        float bs = block_sad_sub(ref, cand, w, h, bx, by, v.x, v.y);
+        float bs = block_sad_sub(ref, cand, w, h, bx, by, v.x, v.y) + lam * (fabsf(v.x) + fabsf(v.y));
         float hx = v.x, hy = v.y;
         for (int dy = -1; dy <= 1; ++dy)
             for (int dx = -1; dx <= 1; ++dx) {
                 if (dx == 0 && dy == 0) continue;
                 const float tx = v.x + 0.5f * dx, ty = v.y + 0.5f * dy;
-                const float s = block_sad_sub(ref, cand, w, h, bx, by, tx, ty);
+                const float s = block_sad_sub(ref, cand, w, h, bx, by, tx, ty) + lam * (fabsf(tx) + fabsf(ty));
                 if (s < bs) { bs = s; hx = tx; hy = ty; }
             }
         v.x = hx; v.y = hy;

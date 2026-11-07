@@ -3,6 +3,10 @@
 #include "pipeline_impl.inl"
 
 #include <cstring>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -30,15 +34,66 @@ std::string last_error() {
 
 namespace detail {
 
+// Size-keyed buffer pool. Planes are reused within a frame and across frames: on Windows a fresh 50 MB
+// allocation costs tens of milliseconds in first-touch page faults, which dominated the CPU path.
+struct CpuPool {
+    std::mutex m;
+    std::multimap<size_t, float*> free_list;
+    size_t idle_bytes = 0;
+    static constexpr size_t kMaxIdleBytes = size_t(3) << 30;   // keep at most 3 GB of idle buffers
+
+    float* get(size_t n) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            auto it = free_list.find(n);
+            if (it != free_list.end()) {
+                float* p = it->second;
+                free_list.erase(it);
+                idle_bytes -= n * sizeof(float);
+                return p;
+            }
+        }
+        return new float[n > 0 ? n : 1];
+    }
+    void put(float* p, size_t n) {
+        std::lock_guard<std::mutex> lk(m);
+        free_list.emplace(n, p);
+        idle_bytes += n * sizeof(float);
+        while (idle_bytes > kMaxIdleBytes && !free_list.empty()) {
+            auto big = std::prev(free_list.end());
+            idle_bytes -= big->first * sizeof(float);
+            delete[] big->second;
+            free_list.erase(big);
+        }
+    }
+    void release_all() {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& e : free_list) delete[] e.second;
+        free_list.clear();
+        idle_bytes = 0;
+    }
+};
+
+CpuPool& cpu_pool() {
+    static CpuPool* p = new CpuPool();   // intentionally leaked; emptied by release_cpu_buffers()
+    return *p;
+}
+
 struct CpuBackend {
     struct Buf {
-        std::unique_ptr<float[]> mem;
         float* p = nullptr;
         size_t n = 0;
         Buf() = default;
-        explicit Buf(size_t count) : mem(new float[count > 0 ? count : 1]), p(mem.get()), n(count) {}
-        Buf(Buf&&) noexcept = default;
-        Buf& operator=(Buf&&) noexcept = default;
+        explicit Buf(size_t count) : p(cpu_pool().get(count)), n(count) {}
+        Buf(const Buf&) = delete;
+        Buf& operator=(const Buf&) = delete;
+        Buf(Buf&& o) noexcept : p(o.p), n(o.n) { o.p = nullptr; o.n = 0; }
+        Buf& operator=(Buf&& o) noexcept {
+            if (this != &o) { reset(); p = o.p; n = o.n; o.p = nullptr; o.n = 0; }
+            return *this;
+        }
+        ~Buf() { reset(); }
+        void reset() { if (p) cpu_pool().put(p, n); p = nullptr; n = 0; }
     };
 
     const Params* params = nullptr;
@@ -89,9 +144,20 @@ struct CpuBackend {
     }
 
     bool aborted() const { return params != nullptr && params->aborted(); }
+
+    bool timing = std::getenv("LIBRENOISE_TIMING") != nullptr;
+    std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+    void mark(const char* stage) {
+        if (!timing) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "  [%-18s] %8.1f ms\n", stage, std::chrono::duration<double, std::milli>(now - t_last).count());
+        t_last = now;
+    }
 };
 
 } // namespace detail
+
+void release_cpu_buffers() noexcept { detail::cpu_pool().release_all(); }
 
 bool denoise_cpu(const FrameView* frames, int32_t n, int32_t ref, int32_t width, int32_t height,
                  const NoiseModel& model, const Params& params, const OutputView& out) {

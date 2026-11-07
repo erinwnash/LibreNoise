@@ -5,15 +5,29 @@ LibreNoise is a production-grade, open-source video denoising plugin for visual 
 
 ---
 
-## Architecture
-The project is decoupled into:
-- **`liblibre_noise` (`src/core`)**: A pure, host-free C++20 core engine implementing:
-  1. *Calibrated Noise Modeling*: Frequency- and channel-resolved noise power spectrum density (PSD), heteroscedastic noise level functions ($\sigma^2(I) = a \cdot I + b$), and variance-stabilizing transforms.
-  2. *Motion Alignment & Trust Gating*: Hierarchical sub-pixel block matching with noise-profile residual trust gating (defending against ghosting) and gain-compensated matching across dissolves and fades.
-  3. *3D Collaborative Spatiotemporal Shrinkage*: Multi-frame patch grouping along motion trajectories with collaborative DCT/Haar thresholding and smooth fallback to 2D spatial filtering.
-  4. *Detail & Look Preservation*: Edge-protected micro-contrast recovery and calibrated synthetic grain re-injection (preventing plastic/waxy skin).
-- **`librenoise_cli` (`src/cli`)**: Headless command-line test harness for automated regression, PSNR/SSIM/LPIPS scoring, and residual analysis.
-- **`LibreNoise.ofx` (`src/ofx`)**: OpenFX 1.5 standard plugin module compatible with DaVinci Resolve, Natron, Nuke, and other OFX hosts.
+## Version 0.2
+
+v0.2 replaces the v0.1 engines (tag `v0.1.0`) with one pipeline, written once and compiled for both the CPU
+(OpenMP + AVX2) and CUDA, so both paths give the same result. See [`docs/V0_2_DESIGN.md`](docs/V0_2_DESIGN.md).
+
+1. **Noise model measured from the footage** (nothing stored or looked up): a noise-vs-brightness curve per
+   R, G, B over the whole frame, a variance-stabilising transform built from that curve, the noise spectrum
+   from flat areas, and a per-scale noise table.
+2. **Source detection**: film grain (independent per colour layer) vs digital sensor (channel-correlated noise)
+   vs compressed video (8x8 block grid). Manual override in the plug-in.
+3. **Temporal filter**: motion-compensated averaging over up to 5 frames each side, scene-cut stop,
+   repeated-frame skip, optional flicker reduction.
+4. **Spatial filter** in Luma / Cb / Cr on a 5-level pyramid (High, Mid, Low, Very Low, Ultra Low), with separate
+   Noise Level and Amount per frequency and channel, tonal equaliser, deblocking and sharpening.
+
+Targets:
+- **`librenoise_core` (`src/core/v2`)**: the pipeline.
+- **`librenoise_cli` (`src/cli`)**: renders EXR sequences, e.g.
+  `librenoise_cli --in src/clip.%04d.exr --out out/clip.%04d.exr --frames 1001 1100 [--gpu]`.
+- **`LibreNoise_v02.ofx.bundle` (`src/ofx`)**: OpenFX plug-in. New identifier `org.librenoise.denoiser_v02`, so it
+  installs next to v0.1 for side-by-side comparison.
+- **`tools/compare_renders.py`**: scores renders against the source and a reference render (noise left per
+  frequency, detail removed, flicker, strength vs brightness). Bring your own frames; none are stored here.
 
 ---
 
@@ -49,3 +63,5 @@ ctest --test-dir build -C Release --output-on-failure
 
 ## Docs
 
+- [v0.2 design and test results](docs/V0_2_DESIGN.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)

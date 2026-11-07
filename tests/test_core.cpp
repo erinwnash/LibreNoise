@@ -228,6 +228,25 @@ int main() {
 #endif
     }
 
+    // -------------------------------------------------------------- digital sensor detection (channel-correlated noise)
+    {
+        std::mt19937 rng(9);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        std::vector<float> dig = clean;
+        for (size_t i = 0; i < static_cast<size_t>(W) * H; ++i) {
+            const float shared = nd(rng);   // demosaic / colour matrix couples the channels
+            for (int c = 0; c < 3; ++c) {
+                const float v = std::max(clean[i * 4 + c], 0.0f);
+                const float sig = std::sqrt(1e-6f + 4e-4f * v);   // shot + read noise (exponent 0.5)
+                dig[i * 4 + c] += sig * (0.8f * shared + 0.6f * nd(rng));
+            }
+        }
+        const NoiseModel dm = estimate_noise_model(FrameView{dig.data(), W * 4, 4}, W, H);
+        check(dm.detected_type == SourceType::DigitalSensor, "channel-correlated noise detected as digital sensor",
+              std::string(source_type_name(dm.detected_type)) + ", corr " + fmt(dm.corr[0]) + "/" + fmt(dm.corr[1]) + "/" + fmt(dm.corr[2]));
+        check(dm.fit_exponent[1] > 0.3f && dm.fit_exponent[1] < 0.7f, "shot-noise exponent ~0.5 recovered", fmt(dm.fit_exponent[1]));
+    }
+
     // -------------------------------------------------------------- compression grid detection
     {
         std::vector<float> blocky = add_noise(clean, W, H, 0.02f, 0.0005f, 77);

@@ -5,6 +5,12 @@
 #include "librenoise/v2/model.hpp"
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+
+#if !defined(__CUDACC__) && defined(__AVX2__)
+#include <immintrin.h>
+#define LN_CPU_AVX2 1
+#endif
 
 #if defined(__CUDACC__)
 #define LN_HD __host__ __device__ __forceinline__
@@ -28,20 +34,39 @@ namespace librenoise::v2::k {
     0.277785117f, -0.490392640f, 0.097545161f, 0.415734806f, -0.415734806f, -0.097545161f, 0.490392640f, -0.277785117f, \
     0.191341716f, -0.461939766f, 0.461939766f, -0.191341716f, -0.191341716f, 0.461939766f, -0.461939766f, 0.191341716f, \
     0.097545161f, -0.277785117f, 0.415734806f, -0.490392640f, 0.490392640f, -0.415734806f, 0.277785117f, -0.097545161f }
+#define LN_DCT_T_TABLE { \
+    0.353553391f, 0.490392640f, 0.461939766f, 0.415734806f, 0.353553391f, 0.277785117f, 0.191341716f, 0.097545161f, \
+    0.353553391f, 0.415734806f, 0.191341716f, -0.097545161f, -0.353553391f, -0.490392640f, -0.461939766f, -0.277785117f, \
+    0.353553391f, 0.277785117f, -0.191341716f, -0.490392640f, -0.353553391f, 0.097545161f, 0.461939766f, 0.415734806f, \
+    0.353553391f, 0.097545161f, -0.461939766f, -0.277785117f, 0.353553391f, 0.415734806f, -0.191341716f, -0.490392640f, \
+    0.353553391f, -0.097545161f, -0.461939766f, 0.277785117f, 0.353553391f, -0.415734806f, -0.191341716f, 0.490392640f, \
+    0.353553391f, -0.277785117f, -0.191341716f, 0.490392640f, -0.353553391f, -0.097545161f, 0.461939766f, -0.415734806f, \
+    0.353553391f, -0.415734806f, 0.191341716f, 0.097545161f, -0.353553391f, 0.490392640f, -0.461939766f, 0.277785117f, \
+    0.353553391f, -0.490392640f, 0.461939766f, -0.415734806f, 0.353553391f, -0.277785117f, 0.191341716f, -0.097545161f }
 #define LN_KAISER_TABLE { 0.438676280f, 0.681324263f, 0.876839905f, 0.985822506f, 0.985822506f, 0.876839905f, 0.681324263f, 0.438676280f }
 
 #if defined(__CUDACC__)
 __constant__ float c_dct[64] = LN_DCT_TABLE;
 __constant__ float c_kaiser[8] = LN_KAISER_TABLE;
+__constant__ float c_dct_t[64] = LN_DCT_T_TABLE;
 #endif
 static const float h_dct[64] = LN_DCT_TABLE;
 static const float h_kaiser[8] = LN_KAISER_TABLE;
+static const float h_dct_t[64] = LN_DCT_T_TABLE;
 
 LN_HD float dct_c(int k, int n) {
 #if defined(__CUDA_ARCH__)
     return c_dct[k * 8 + n];
 #else
     return h_dct[k * 8 + n];
+#endif
+}
+// Transposed basis: dct_t(n, k) == dct_c(k, n), stored so the inner loops below run over contiguous memory.
+LN_HD float dct_t(int n, int k) {
+#if defined(__CUDA_ARCH__)
+    return c_dct_t[n * 8 + k];
+#else
+    return h_dct_t[n * 8 + k];
 #endif
 }
 LN_HD float kaiser(int i) {
@@ -66,12 +91,56 @@ LN_HD int reflect(int i, int n) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Fast log2 / exp2 (~1e-7 relative), identical on CPU and GPU. The CRT versions dominate per-pixel cost on MSVC.
+// ------------------------------------------------------------------------------------------------
+LN_HD int f2i_bits(float f) {
+#if defined(__CUDA_ARCH__)
+    return __float_as_int(f);
+#else
+    int i;
+    std::memcpy(&i, &f, sizeof(i));
+    return i;
+#endif
+}
+LN_HD float i2f_bits(int i) {
+#if defined(__CUDA_ARCH__)
+    return __int_as_float(i);
+#else
+    float f;
+    std::memcpy(&f, &i, sizeof(f));
+    return f;
+#endif
+}
+
+LN_HD float fast_log2(float x) {           // x > 0, finite
+    int bits = f2i_bits(x);
+    int e = ((bits >> 23) & 255) - 127;
+    float m = i2f_bits((bits & 0x007fffff) | 0x3f800000);   // [1, 2)
+    if (m > 1.41421356f) { m *= 0.5f; e += 1; }             // [0.707, 1.414)
+    const float s = (m - 1.0f) / (m + 1.0f);
+    const float s2 = s * s;
+    const float ln = 2.0f * s * (1.0f + s2 * (0.333333333f + s2 * (0.2f + s2 * (0.142857143f + s2 * 0.111111111f))));
+    return static_cast<float>(e) + ln * 1.442695041f;
+}
+
+LN_HD float fast_exp2(float y) {
+    if (y < -126.0f) return 0.0f;
+    if (y > 127.0f) y = 127.0f;
+    const float fi = floorf(y);
+    const float z = (y - fi - 0.5f) * 0.693147181f;           // [-0.347, 0.347)
+    const float p = 1.0f + z * (1.0f + z * (0.5f + z * (0.166666667f + z * (0.041666667f + z * (0.008333333f + z * 0.001388889f)))));
+    return p * 1.414213562f * i2f_bits((static_cast<int>(fi) + 127) << 23);
+}
+
+LN_HD float fast_exp(float x) { return fast_exp2(x * 1.442695041f); }
+
+// ------------------------------------------------------------------------------------------------
 // Variance stabilisation
 // ------------------------------------------------------------------------------------------------
 LN_HD float vst_fwd(const VstLut& L, int c, float x) {
     if (x <= L.x0) return x / L.sigma0[c];
     if (x >= L.x1) return L.f1[c] + (x - L.x1) / L.sigma1[c];
-    const float t = (log2f(x) - L.log2x0) / (L.log2x1 - L.log2x0) * static_cast<float>(kVstFwd - 1);
+    const float t = (fast_log2(x) - L.log2x0) / (L.log2x1 - L.log2x0) * static_cast<float>(kVstFwd - 1);
     const int i = iclamp(static_cast<int>(t), 0, kVstFwd - 2);
     const float fr = t - static_cast<float>(i);
     return L.fwd[c][i] + (L.fwd[c][i + 1] - L.fwd[c][i]) * fr;
@@ -83,7 +152,7 @@ LN_HD float vst_inv(const VstLut& L, int c, float y) {
     const float t = (y - L.f0[c]) / (L.f1[c] - L.f0[c]) * static_cast<float>(kVstInv - 1);
     const int i = iclamp(static_cast<int>(t), 0, kVstInv - 2);
     const float fr = t - static_cast<float>(i);
-    return exp2f(L.inv[c][i] + (L.inv[c][i + 1] - L.inv[c][i]) * fr);
+    return fast_exp2(L.inv[c][i] + (L.inv[c][i + 1] - L.inv[c][i]) * fr);
 }
 
 // Orthonormal opponent transform: Y = (R+G+B)/sqrt3, Cb = (2B-R-G)/sqrt6, Cr = (R-G)/sqrt2
@@ -157,40 +226,94 @@ LN_HD float box_down(const float* src, int w, int h, int x, int y) {
 // ------------------------------------------------------------------------------------------------
 // 8x8 DCT
 // ------------------------------------------------------------------------------------------------
-LN_HD void dct8x8(const float* in, float* out) {
-    float tmp[64];
+#if defined(LN_CPU_AVX2)
+// AVX2 / FMA versions of the separable transforms for the CPU build (same arithmetic order as the scalar form).
+inline void dct8x8_avx(const float* in, float* out) {
+    __m256 tmp[8];
     for (int r = 0; r < 8; ++r) {
-        for (int k = 0; k < 8; ++k) {
-            float s = 0.0f;
-            for (int n = 0; n < 8; ++n) s += dct_c(k, n) * in[r * 8 + n];
-            tmp[r * 8 + k] = s;
-        }
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(in[r * 8]), _mm256_loadu_ps(h_dct_t));
+        for (int n = 1; n < 8; ++n) acc = _mm256_fmadd_ps(_mm256_set1_ps(in[r * 8 + n]), _mm256_loadu_ps(h_dct_t + n * 8), acc);
+        tmp[r] = acc;
     }
-    for (int c = 0; c < 8; ++c) {
-        for (int k = 0; k < 8; ++k) {
-            float s = 0.0f;
-            for (int n = 0; n < 8; ++n) s += dct_c(k, n) * tmp[n * 8 + c];
-            out[k * 8 + c] = s;
-        }
+    for (int k = 0; k < 8; ++k) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(h_dct[k * 8]), tmp[0]);
+        for (int n = 1; n < 8; ++n) acc = _mm256_fmadd_ps(_mm256_set1_ps(h_dct[k * 8 + n]), tmp[n], acc);
+        _mm256_storeu_ps(out + k * 8, acc);
     }
+}
+inline void idct8x8_avx(const float* in, float* out) {
+    __m256 tmp[8];
+    for (int r = 0; r < 8; ++r) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(in[r * 8]), _mm256_loadu_ps(h_dct));
+        for (int k = 1; k < 8; ++k) acc = _mm256_fmadd_ps(_mm256_set1_ps(in[r * 8 + k]), _mm256_loadu_ps(h_dct + k * 8), acc);
+        tmp[r] = acc;
+    }
+    for (int n = 0; n < 8; ++n) {
+        __m256 acc = _mm256_mul_ps(_mm256_set1_ps(h_dct_t[n * 8]), tmp[0]);
+        for (int k = 1; k < 8; ++k) acc = _mm256_fmadd_ps(_mm256_set1_ps(h_dct_t[n * 8 + k]), tmp[k], acc);
+        _mm256_storeu_ps(out + n * 8, acc);
+    }
+}
+// num[row] += wgt * kaiser(j) * kaiser(i) * blk[row], den[row] += same weight, for the 8 rows of a block
+inline void accumulate_block_avx(const float* blk, float wgt, float* num, float* den, size_t row0, int pw) {
+    const __m256 kx = _mm256_loadu_ps(h_kaiser);
+    for (int j = 0; j < 8; ++j) {
+        const __m256 ww = _mm256_mul_ps(_mm256_set1_ps(wgt * h_kaiser[j]), kx);
+        float* nr = num + row0 + static_cast<size_t>(j) * pw;
+        float* dr = den + row0 + static_cast<size_t>(j) * pw;
+        _mm256_storeu_ps(nr, _mm256_fmadd_ps(ww, _mm256_loadu_ps(blk + j * 8), _mm256_loadu_ps(nr)));
+        _mm256_storeu_ps(dr, _mm256_add_ps(ww, _mm256_loadu_ps(dr)));
+    }
+}
+#endif
+
+// Separable 8x8 transforms. Every inner loop runs over 8 contiguous floats (AVX on the CPU, unrolled registers on CUDA).
+LN_HD void dct8x8(const float* in, float* out) {
+#if defined(LN_CPU_AVX2)
+    dct8x8_avx(in, out);
+#else
+    float tmp[64];
+    for (int r = 0; r < 8; ++r) {              // tmp[r][k] = sum_n in[r][n] C[k][n]
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int n = 0; n < 8; ++n) {
+            const float v = in[r * 8 + n];
+            for (int k = 0; k < 8; ++k) acc[k] += v * dct_t(n, k);
+        }
+        for (int k = 0; k < 8; ++k) tmp[r * 8 + k] = acc[k];
+    }
+    for (int k = 0; k < 8; ++k) {              // out[k][c] = sum_n C[k][n] tmp[n][c]
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int n = 0; n < 8; ++n) {
+            const float cv = dct_c(k, n);
+            for (int c = 0; c < 8; ++c) acc[c] += cv * tmp[n * 8 + c];
+        }
+        for (int c = 0; c < 8; ++c) out[k * 8 + c] = acc[c];
+    }
+#endif
 }
 
 LN_HD void idct8x8(const float* in, float* out) {
+#if defined(LN_CPU_AVX2)
+    idct8x8_avx(in, out);
+#else
     float tmp[64];
-    for (int r = 0; r < 8; ++r) {
-        for (int n = 0; n < 8; ++n) {
-            float s = 0.0f;
-            for (int k = 0; k < 8; ++k) s += dct_c(k, n) * in[r * 8 + k];
-            tmp[r * 8 + n] = s;
+    for (int r = 0; r < 8; ++r) {              // tmp[r][n] = sum_k in[r][k] C[k][n]
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < 8; ++k) {
+            const float v = in[r * 8 + k];
+            for (int n = 0; n < 8; ++n) acc[n] += v * dct_c(k, n);
         }
+        for (int n = 0; n < 8; ++n) tmp[r * 8 + n] = acc[n];
     }
-    for (int c = 0; c < 8; ++c) {
-        for (int n = 0; n < 8; ++n) {
-            float s = 0.0f;
-            for (int k = 0; k < 8; ++k) s += dct_c(k, n) * tmp[k * 8 + c];
-            out[n * 8 + c] = s;
+    for (int n = 0; n < 8; ++n) {              // out[n][c] = sum_k C[k][n] tmp[k][c]
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int k = 0; k < 8; ++k) {
+            const float cv = dct_t(n, k);
+            for (int c = 0; c < 8; ++c) acc[c] += cv * tmp[k * 8 + c];
         }
+        for (int c = 0; c < 8; ++c) out[n * 8 + c] = acc[c];
     }
+#endif
 }
 
 // Hard-threshold pilot for one block. img/num/den are pw-wide padded planes; (bx, by) = block origin.
@@ -208,6 +331,9 @@ LN_HD void block_ht(const float* img, int pw, int bx, int by, const float* sig, 
     }
     idct8x8(co, blk);
     const float wgt = 1.0f / static_cast<float>(imax(1, nnz));
+#if defined(LN_CPU_AVX2)
+    accumulate_block_avx(blk, wgt, num, den, static_cast<size_t>(by) * pw + bx, pw);
+#else
     for (int j = 0; j < 8; ++j) {
         const float wj = kaiser(j);
         for (int i = 0; i < 8; ++i) {
@@ -217,6 +343,7 @@ LN_HD void block_ht(const float* img, int pw, int bx, int by, const float* sig, 
             den[o] += ww;
         }
     }
+#endif
 }
 
 // Empirical Wiener for one block using the pilot estimate.
@@ -242,6 +369,9 @@ LN_HD void block_wiener(const float* img, const float* pilot, int pw, int bx, in
     }
     idct8x8(co, blk);
     const float wgt = 1.0f / (wsum + 1e-6f);
+#if defined(LN_CPU_AVX2)
+    accumulate_block_avx(blk, wgt, num, den, static_cast<size_t>(by) * pw + bx, pw);
+#else
     for (int j = 0; j < 8; ++j) {
         const float wj = kaiser(j);
         for (int i = 0; i < 8; ++i) {
@@ -251,6 +381,7 @@ LN_HD void block_wiener(const float* img, const float* pilot, int pw, int bx, in
             den[o] += ww;
         }
     }
+#endif
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -266,6 +397,11 @@ LN_HD float sample_bilinear(const float* p, int w, int h, float x, float y) {
     const float fx = floorf(x), fy = floorf(y);
     const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
     const float ax = x - fx, ay = y - fy;
+    if (x0 >= 0 && y0 >= 0 && x0 + 1 < w && y0 + 1 < h) {
+        const float* r0 = p + static_cast<size_t>(y0) * w + x0;
+        const float* r1 = r0 + w;
+        return (r0[0] + (r0[1] - r0[0]) * ax) * (1.0f - ay) + (r1[0] + (r1[1] - r1[0]) * ax) * ay;
+    }
     const float a = sample_clamped(p, w, h, x0, y0), b = sample_clamped(p, w, h, x0 + 1, y0);
     const float c = sample_clamped(p, w, h, x0, y0 + 1), d = sample_clamped(p, w, h, x0 + 1, y0 + 1);
     return (a + (b - a) * ax) * (1.0f - ay) + (c + (d - c) * ax) * ay;
@@ -417,7 +553,7 @@ LN_HD float hash_gauss(int x, int y, uint32_t seed) {
 
 // Tonal multiplier from linear luma: knots at -5, -2.5, 0, +1.5, +3 stops around 18% grey.
 LN_HD float tonal_factor(const float* t, float luma) {
-    const float stops = log2f(fmaxf(luma, 1e-6f) / 0.18f);
+    const float stops = fast_log2(fmaxf(luma, 1e-6f) / 0.18f);
     const float k0 = -5.0f, k1 = -2.5f, k2 = 0.0f, k3 = 1.5f, k4 = 3.0f;
     if (stops <= k0) return t[0];
     if (stops >= k4) return t[4];

@@ -5,6 +5,9 @@
 #include <cuda_runtime.h>
 
 #include <map>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -137,6 +140,16 @@ struct CudaBackend {
     }
 
     bool aborted() const { return params != nullptr && params->aborted(); }
+
+    bool timing = std::getenv("LIBRENOISE_TIMING") != nullptr;
+    std::chrono::steady_clock::time_point t_last = std::chrono::steady_clock::now();
+    void mark(const char* stage) {
+        if (!timing) return;
+        cudaStreamSynchronize(stream);
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "  [%-18s] %8.1f ms\n", stage, std::chrono::duration<double, std::milli>(now - t_last).count());
+        t_last = now;
+    }
 };
 
 } // namespace detail

@@ -850,7 +850,7 @@ OfxStatus action_render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs
 OfxStatus plugin_main_entry(const char* action, const void* h, OfxPropertySetHandle inArgs, OfxPropertySetHandle outArgs) {
     auto effect = reinterpret_cast<OfxImageEffectHandle>(const_cast<void*>(h));
     if (std::strcmp(action, kOfxActionLoad) == 0) return action_load();
-    if (std::strcmp(action, kOfxActionUnload) == 0) { v2::cuda_release(); return kOfxStatOK; }
+    if (std::strcmp(action, kOfxActionUnload) == 0) { v2::cuda_release(); v2::release_cpu_buffers(); return kOfxStatOK; }
     if (std::strcmp(action, kOfxActionDescribe) == 0) return action_describe(effect);
     if (std::strcmp(action, kOfxImageEffectActionDescribeInContext) == 0) return action_describe_in_context(effect, inArgs);
     if (std::strcmp(action, kOfxActionCreateInstance) == 0) return action_create_instance(effect);

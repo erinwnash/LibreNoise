@@ -1,9 +1,5 @@
 #include "ae_sdk.hpp"
 #include "librenoise/librenoise.hpp"
-#include "librenoise/gpu_denoiser.hpp"
-#include "librenoise/roi_analyzer.hpp"
-#include "librenoise/profile_curve.hpp"
-#include "librenoise/profile_io.hpp"
 
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
 #include <cuda_runtime.h>
@@ -23,6 +19,8 @@
 #endif
 
 namespace librenoise::ae {
+
+struct AnalysisRoi { int32_t x = 0, y = 0, width = 128, height = 128; };
 
 enum ParamIndex : int32_t {
     PARAM_INPUT = 0,
@@ -68,7 +66,7 @@ PF_Err handle_about(PF_InData* in_data, PF_OutData* out_data) {
     (void)in_data;
     if (out_data) {
         std::strncpy(out_data->return_msg,
-            "LibreNoise Video Denoiser v0.1.0\n"
+            "LibreNoise Video Denoiser v0.2.0\n"
             "Open-source production-grade temporal & spatial video denoiser.\n"
             "Interactive noise profiling workflow.\n"
             "Accelerated via CUDA sm_86 & AVX2.",
@@ -80,7 +78,7 @@ PF_Err handle_about(PF_InData* in_data, PF_OutData* out_data) {
 PF_Err handle_global_setup(PF_InData* in_data, PF_OutData* out_data) {
     (void)in_data;
     if (out_data) {
-        out_data->my_version = 0x00010000; // 1.0.0
+        out_data->my_version = 0x00020000; // 0.2.0
         out_data->out_flags = PF_OutFlag_PIX_INDEPENDENT |
                               PF_OutFlag_DEEP_COLOR_AWARE |
                               PF_OutFlag_CUSTOM_UI;
@@ -190,86 +188,16 @@ PF_Err handle_render(
     PF_LayerDef* input = reinterpret_cast<PF_LayerDef*>(params[PARAM_INPUT]);
     if (!input || !input->data) return PF_Err_NONE;
 
-    // Convert input to VideoFrame32F for accurate profiling / fallback
-    VideoFrame32F frame(width, height);
-    const auto* src = reinterpret_cast<const float*>(input->data);
-    int floatStride = rowbytes / static_cast<int>(sizeof(float));
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            frame.channels[0].at(x, y) = src[y * floatStride + x * 4 + 0]; // R
-            frame.channels[1].at(x, y) = src[y * floatStride + x * 4 + 1]; // G
-            frame.channels[2].at(x, y) = src[y * floatStride + x * 4 + 2]; // B
-        }
-    }
-
-    auto autoProf = NoiseProfiler::auto_estimate(frame);
-
-    // Check if CUDA GPU is available for zero-overhead acceleration
-    if (is_cuda_available()) {
-        CudaDenoiseParams cp;
-        cp.width = width;
-        cp.height = height;
-        cp.stride_floats = floatStride;
-        cp.channels = 4;
-        cp.step_size = 4;
-        cp.temporal_weight = 1.0f;
-        cp.spatial_weight = 1.0f;
-        cp.detail_recovery = 0.15f;
-        cp.grain_amount = 0.0f;
-        for (int i = 0; i < 3; ++i) {
-            cp.nlf_a[i] = autoProf.nlf_per_channel[i].a;
-            cp.nlf_b[i] = autoProf.nlf_per_channel[i].b;
-            for (int b = 0; b < 5; ++b) {
-                cp.psd_weights[i][b] = autoProf.psd.octave_weights[i][b];
-            }
-        }
-
-        // Process via GPU
-        size_t frameBytes = static_cast<size_t>(rowbytes * height);
-        float* d_src = nullptr;
-        float* d_dst = nullptr;
-
-#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-        if (cudaMalloc(&d_src, frameBytes) == cudaSuccess &&
-            cudaMalloc(&d_dst, frameBytes) == cudaSuccess) {
-            cudaMemcpy(d_src, input->data, frameBytes, cudaMemcpyHostToDevice);
-
-            const float* frame_arr[1] = {d_src};
-            const float** d_frame_arr = nullptr;
-            cudaMalloc(&d_frame_arr, sizeof(float*));
-            cudaMemcpy(d_frame_arr, frame_arr, sizeof(float*), cudaMemcpyHostToDevice);
-
-            bool ok = cuda_denoise_device(d_frame_arr, 1, 0, d_dst, cp, nullptr);
-            if (ok) {
-                cudaMemcpy(output->data, d_dst, frameBytes, cudaMemcpyDeviceToHost);
-            }
-
-            cudaFree(d_frame_arr);
-            cudaFree(d_src);
-            cudaFree(d_dst);
-
-            if (ok) return PF_Err_NONE;
-        }
-#endif
-    }
-
-    VideoDenoiser::Config cfg;
-    cfg.temporal_radius = 0; // Single-frame fallback when temporal frames not provided
-    cfg.filter_params.engine = DenoiseEngine::Collaborative3D;
-    cfg.filter_params.quality = QualityPreset::Balanced;
-    VideoDenoiser denoiser(cfg);
-    VideoFrame32F denoised = denoiser.process_window({frame}, &autoProf);
-
-    auto* dst = reinterpret_cast<float*>(output->data);
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            dst[y * floatStride + x * 4 + 0] = std::max(0.0f, denoised.channels[0].at(x, y));
-            dst[y * floatStride + x * 4 + 1] = std::max(0.0f, denoised.channels[1].at(x, y));
-            dst[y * floatStride + x * 4 + 2] = std::max(0.0f, denoised.channels[2].at(x, y));
-            dst[y * floatStride + x * 4 + 3] = src[y * floatStride + x * 4 + 3];
-        }
-    }
-
+    // Single-frame path (this skeleton host integration does not fetch neighbouring frames yet):
+    // measure the noise model from the frame and run the v0.2 spatial filter.
+    const int floatStride = rowbytes / static_cast<int>(sizeof(float));
+    const v2::FrameView view{reinterpret_cast<const float*>(input->data), floatStride, 4};
+    const v2::NoiseModel model = v2::estimate_noise_model(view, width, height);
+    if (!model.valid) return PF_Err_NONE;
+    v2::Params p;
+    p.temporal_radius = 0;
+    v2::denoise_cpu(&view, 1, 0, width, height, model, p,
+                    v2::OutputView{reinterpret_cast<float*>(output->data), floatStride, 4});
     return PF_Err_NONE;
 }
 

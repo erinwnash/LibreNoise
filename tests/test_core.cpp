@@ -1,448 +1,253 @@
+// LibreNoise v0.2 core tests. Plain executable: prints each check and returns non-zero on any failure.
 #include "librenoise/librenoise.hpp"
-#include "librenoise/gpu_denoiser.hpp"
-#include "librenoise/roi_analyzer.hpp"
-#include "librenoise/profile_curve.hpp"
-#include "librenoise/profile_io.hpp"
+#include "../src/core/v2/kernels.hpp"
+
 #if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
 #include <cuda_runtime.h>
 #endif
-#include <iostream>
-#include <cassert>
-#include <cstdlib>
+
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
+#include <iostream>
+#include <memory>
 #include <random>
+#include <string>
+#include <vector>
 
-#define LN_REQUIRE(cond)                                                               \
-    do {                                                                               \
-        if (!(cond)) {                                                                 \
-            std::cerr << "[FAIL] " << __FILE__ << ":" << __LINE__ << ": " #cond "\n"; \
-            std::exit(1);                                                              \
-        }                                                                              \
-    } while (0)
+using namespace librenoise::v2;
 
-using namespace librenoise;
+namespace {
 
-void test_variance_stabilization() {
-    std::cout << "[Test] Running Generalized Anscombe transform test...\n";
-    ImagePlane32F plane(16, 16);
-    NoiseLevelFunction nlf{0.002f, 0.0001f};
+int g_failures = 0;
 
-    plane.fill(0.45f);
-    NoiseProfiler::apply_variance_stabilization(plane, nlf);
-    assert(plane.at(8, 8) > 0.0f);
-
-    NoiseProfiler::invert_variance_stabilization(plane, nlf);
-    float reconstructed = plane.at(8, 8);
-    float err = std::abs(reconstructed - 0.45f);
-    assert(err < 0.001f);
-    std::cout << "  -> Passed: Inversion error < 0.001 (actual: " << err << ")\n";
+void check(bool ok, const std::string& what, const std::string& detail = "") {
+    std::cout << (ok ? "  PASS  " : "  FAIL  ") << what;
+    if (!detail.empty()) std::cout << "  (" << detail << ")";
+    std::cout << "\n";
+    if (!ok) ++g_failures;
 }
 
-void test_scene_cut_detection() {
-    std::cout << "[Test] Running scene cut detector...\n";
-    ImagePlane32F frame1(64, 64);
-    ImagePlane32F frame2(64, 64);
-    frame1.fill(0.2f);
-    frame2.fill(0.85f); // Drastic change
+std::string fmt(double v) { char b[64]; std::snprintf(b, sizeof(b), "%.4g", v); return b; }
 
-    bool is_cut = MotionEstimator::is_scene_cut(frame1, frame2, 0.35f);
-    assert(is_cut == true);
-
-    frame2.fill(0.21f); // Minor variation
-    is_cut = MotionEstimator::is_scene_cut(frame1, frame2, 0.35f);
-    assert(is_cut == false);
-    std::cout << "  -> Passed: Scene cut correctly discriminated.\n";
-}
-
-void test_3d_collaborative_filtering() {
-    std::cout << "[Test] Running 3D collaborative transform filter on synthetic pattern...\n";
-    const int32_t w = 64;
-    const int32_t h = 64;
-    std::vector<VideoFrame32F> sequence;
-
-    for (int i = 0; i < 3; ++i) {
-        VideoFrame32F frame(w, h, 1);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                // Diagonal pattern with synthetic noise
-                float clean = (x + y > 64) ? 0.7f : 0.3f;
-                float noise = ((x * 17 + y * 31 + i * 53) % 100 - 50) * 0.002f;
-                frame.channels[0].at(x, y) = clean + noise;
-            }
-        }
-        sequence.push_back(frame);
-    }
-
-    VideoDenoiser::Config cfg;
-    cfg.temporal_radius = 1;
-    cfg.filter_params.patch_size = 8;
-    cfg.filter_params.step_size = 4;
-    VideoDenoiser denoiser(cfg);
-
-    VideoFrame32F result = denoiser.process_window(sequence);
-    assert(result.is_valid());
-    assert(result.width == w && result.height == h);
-    std::cout << "  -> Passed: Filter completed successfully.\n";
-}
-
-void test_roi_and_profiling() {
-    std::cout << "[Test] Running ROI analyzer and featureless patch detector...\n";
-    const int32_t w = 256;
-    const int32_t h = 256;
-    VideoFrame32F frame(w, h, 3);
-
-    // Create an image with an edge/feature on the left and a flat noisy patch on the right
-    for (int y = 0; y < h; ++y) {
+// Smooth synthetic scene with edges, a gradient and some texture, values in [0.01, 1.2]
+std::vector<float> make_scene(int w, int h) {
+    std::vector<float> img(static_cast<size_t>(w) * h * 4);
+    for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            float val = 0.5f;
-            if (x < 100) {
-                // High contrast edge pattern
-                val = ((x / 16) % 2 == 0) ? 0.9f : 0.1f;
-            } else {
-                // Featureless area with mild noise
-                float n = ((x * 19 + y * 37) % 100 - 50) * 0.001f;
-                val = 0.45f + n;
-            }
-            frame.channels[0].at(x, y) = val;
-            frame.channels[1].at(x, y) = val;
-            frame.channels[2].at(x, y) = val;
+            const float gx = static_cast<float>(x) / w, gy = static_cast<float>(y) / h;
+            float base = 0.02f + 1.1f * gx * gx;
+            if ((x / 64 + y / 64) % 2 == 0) base *= 0.6f;
+            const float tex = 0.03f * std::sin(x * 0.21f) * std::sin(y * 0.17f);
+            float* p = &img[(static_cast<size_t>(y) * w + x) * 4];
+            p[0] = base * (0.9f + 0.2f * gy) + tex;
+            p[1] = base + tex;
+            p[2] = base * (1.1f - 0.2f * gy) + tex;
+            p[3] = 1.0f;
         }
-    }
-
-    AnalysisRoi roi = NoiseRoiAnalyzer::find_optimal_roi(frame, 64, 32);
-    assert(roi.is_valid(w, h));
-    // The optimal patch should avoid the edges on the left (x >= 100)
-    assert(roi.x >= 90);
-    std::cout << "  -> Auto-detected optimal ROI: [" << roi.x << ", " << roi.y 
-              << ", w=" << roi.width << ", h=" << roi.height << "]\n";
-
-    RoiAnalysisResult result = NoiseRoiAnalyzer::analyze_roi(frame, roi);
-    assert(result.uniformity_score > 70.0f);
-    assert(result.sigma_y > 0.0f);
-    std::cout << "  -> Quality score: " << result.uniformity_score << "%, Assessment: " << result.assessment << "\n";
-    std::cout << "  -> Passed: ROI analyzer found and analyzed uniform patch.\n";
+    return img;
 }
 
-void test_profile_curve_spline() {
-    std::cout << "[Test] Running NoiseProfileCurve cubic Hermite spline...\n";
-    NoiseProfileCurve curve({
-        {0.00f, 1.40f},
-        {0.25f, 1.20f},
-        {0.50f, 1.00f},
-        {0.75f, 0.90f},
-        {1.00f, 0.80f}
-    });
-
-    // Exact knot evaluations
-    assert(std::abs(curve.evaluate(0.00f) - 1.40f) < 1e-4f);
-    assert(std::abs(curve.evaluate(0.50f) - 1.00f) < 1e-4f);
-    assert(std::abs(curve.evaluate(1.00f) - 0.80f) < 1e-4f);
-
-    // Intermediate points should be strictly monotonic decreasing between these knots
-    float val_10 = curve.evaluate(0.10f);
-    float val_40 = curve.evaluate(0.40f);
-    float val_60 = curve.evaluate(0.60f);
-    assert(val_10 < 1.40f && val_10 > 1.20f);
-    assert(val_40 < 1.20f && val_40 > 1.00f);
-    assert(val_60 < 1.00f && val_60 > 0.90f);
-
-    // Clamping outside [0, 1]
-    assert(curve.evaluate(-0.5f) == 1.40f);
-    assert(curve.evaluate(1.5f) == 0.80f);
-    std::cout << "  -> Passed: Cubic Hermite spline evaluates smoothly without oscillations.\n";
-}
-
-void test_profile_serialization() {
-    std::cout << "[Test] Running LibreNoise profile (.lnp) serialization...\n";
-    LibreNoiseDeviceProfile p;
-    p.device_name = "Sony A7S III";
-    p.mode_description = "4K S-Log3 ISO 12800";
-    p.resolution_width = 3840;
-    p.resolution_height = 2160;
-    p.uniformity_score = 96.5f;
-    p.quality_assessment = "Excellent";
-    p.analysis_roi = {512, 512, 256, 256};
-    p.nlf_y = {0.0025f, 0.0003f};
-    p.nlf_cb = {0.0018f, 0.0002f};
-    p.nlf_cr = {0.0019f, 0.0002f};
-    p.psd_5band = {1.25f, 1.10f, 1.00f, 0.85f, 0.70f};
-
-    std::string tempFile = (std::filesystem::temp_directory_path() / "test_librenoise.lnp").string();
-
-    bool saved = ProfileSerializer::save_to_file(tempFile, p);
-    assert(saved);
-
-    LibreNoiseDeviceProfile loaded;
-    bool loadedOk = ProfileSerializer::load_from_file(tempFile, loaded);
-    assert(loadedOk);
-
-    assert(loaded.device_name == "Sony A7S III");
-    assert(loaded.mode_description == "4K S-Log3 ISO 12800");
-    assert(loaded.resolution_width == 3840);
-    assert(loaded.resolution_height == 2160);
-    assert(std::abs(loaded.uniformity_score - 96.5f) < 0.1f);
-    assert(loaded.quality_assessment == "Excellent");
-    assert(loaded.analysis_roi.x == 512 && loaded.analysis_roi.width == 256);
-    assert(std::abs(loaded.nlf_y.a - 0.0025f) < 1e-5f);
-    assert(std::abs(loaded.psd_5band[0] - 1.25f) < 1e-4f);
-    assert(std::abs(loaded.psd_5band[4] - 0.70f) < 1e-4f);
-
-    std::filesystem::remove(tempFile);
-    std::cout << "  -> Passed: .lnp profile saved and reloaded with 100% fidelity.\n";
-}
-
-void test_motion_field_resilience() {
-    std::cout << "[Test] Running MotionField and Scene-Cut resilience test...\n";
-    MotionField empty_mf;
-    assert(!empty_mf.is_valid());
-
-    auto mv = empty_mf.get_vector_at_pixel(100, 200);
-    assert(mv.dx == 0 && mv.dy == 0);
-    assert(mv.trusted == true);
-
-    empty_mf.is_scene_cut = true;
-    auto mv_cut = empty_mf.get_vector_at_pixel(100, 200);
-    assert(mv_cut.trusted == false);
-
-    // Sequence with a hard scene cut
-    const int32_t w = 64;
-    const int32_t h = 64;
-    std::vector<VideoFrame32F> sequence;
-    for (int i = 0; i < 3; ++i) {
-        VideoFrame32F frame(w, h, 1);
-        float base = (i == 1) ? 0.9f : 0.1f; // Frame 1 is completely different (scene cut)
-        frame.channels[0].fill(base);
-        sequence.push_back(frame);
-    }
-
-    VideoDenoiser::Config cfg;
-    cfg.temporal_radius = 1;
-    cfg.match_params.cut_detection_threshold = 0.3f;
-    VideoDenoiser denoiser(cfg);
-    VideoFrame32F result = denoiser.process_window(sequence);
-    assert(result.is_valid());
-    std::cout << "  -> Passed: Uninitialized/cut MotionField handles boundaries safely.\n";
-}
-
-void test_gpu_cpu_correlated_grain_parity() {
-    std::cout << "[Test] Running correlated grain PSD & GPU/CPU parity test...\n";
-    const int w = 160;
-    const int h = 128;
-    const int stride = w * 4;
-    const int num_frames = 3;
-    const int ref_idx = 1;
-
-    std::vector<VideoFrame32F> clean_frames(num_frames, VideoFrame32F(w, h, 3));
-    std::vector<VideoFrame32F> noisy_frames(num_frames, VideoFrame32F(w, h, 3));
-    std::vector<std::vector<float>> rgba_frames(num_frames, std::vector<float>(stride * h, 1.0f));
-
-    std::mt19937 rng(1337);
-    std::normal_distribution<float> norm(0.0f, 1.0f);
-
-    for (int f = 0; f < num_frames; ++f) {
-        int dx = (f - ref_idx) * 3;
-        int dy = (f - ref_idx) * 1;
-        std::vector<float> raw(w * h * 3);
-        for (float& v : raw) v = norm(rng);
-
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                int sx = std::clamp(x + dx, 0, w - 1);
-                int sy = std::clamp(y + dy, 0, h - 1);
-                // Include flat region on left, midtone ramp, and HDR > 1.0 highlight patch on right
-                float clean = 0.12f;
-                if (sx > 96 && sy > 32 && sy < 96) {
-                    clean = 2.25f; // HDR scene-linear highlight (> 1.0)
-                } else if (sx > 64) {
-                    clean = 0.35f;
-                }
-
-                for (int c = 0; c < 3; ++c) {
-                    float corr = 0.0f;
-                    for (int ky = -1; ky <= 1; ++ky) {
-                        for (int kx = -1; kx <= 1; ++kx) {
-                            int nx = std::clamp(x + kx, 0, w - 1);
-                            int ny = std::clamp(y + ky, 0, h - 1);
-                            corr += raw[(ny * w + nx) * 3 + c];
-                        }
-                    }
-                    corr /= 3.0f;
-                    float fine = raw[(y * w + x) * 3 + c];
-                    float sigma = std::sqrt(0.00025f * clean + 0.00015f);
-                    float val = std::max(0.0f, clean + (0.8f * corr + 0.2f * fine) * sigma);
-                    clean_frames[f].channels[c].at(x, y) = clean;
-                    noisy_frames[f].channels[c].at(x, y) = val;
-                    rgba_frames[f][y * stride + x * 4 + c] = val;
-                }
-            }
-        }
-    }
-
-    // 1. Verify ROI analyzer detects correlated low-frequency grain energy (measured_psd[0] > 1.25f)
-    AnalysisRoi flat_roi{8, 16, 48, 96};
-    RoiAnalysisResult roi_res = NoiseRoiAnalyzer::analyze_roi(noisy_frames[ref_idx], flat_roi);
-    LN_REQUIRE(roi_res.sigma_y > 0.008f && roi_res.sigma_y < 0.030f);
-    LN_REQUIRE(roi_res.measured_psd[0] > 1.25f);
-
-    // 2. Verify auto_estimate also populates correlated PSD weights and accurate NLF
-    auto auto_prof = NoiseProfiler::auto_estimate(noisy_frames[ref_idx]);
-    LN_REQUIRE(auto_prof.psd.octave_weights[0][0] > 1.20f);
-
-    auto calc_psnr = [&](const VideoFrame32F& est) {
-        double mse = 0.0;
-        for (int c = 0; c < 3; ++c) {
-            for (int y = 12; y < h - 12; ++y) {
-                for (int x = 12; x < w - 12; ++x) {
-                    double d = est.channels[c].at(x, y) - clean_frames[ref_idx].channels[c].at(x, y);
-                    mse += d * d;
-                }
-            }
-        }
-        mse /= (3.0 * (w - 24) * (h - 24));
-        return 10.0 * std::log10(1.0 / mse);
-    };
-
-    double noisy_psnr = calc_psnr(noisy_frames[ref_idx]);
-
-    VideoDenoiser::Config cfg;
-    cfg.temporal_radius = 1;
-    VideoDenoiser cpu_denoiser(cfg);
-    VideoFrame32F cpu_out = cpu_denoiser.process_window(noisy_frames, &auto_prof);
-    double cpu_psnr = calc_psnr(cpu_out);
-    LN_REQUIRE(cpu_psnr > noisy_psnr + 7.0);
-    // Verify HDR > 1.0 highlight was NOT clipped to 1.0 on CPU
-    LN_REQUIRE(cpu_out.channels[0].at(120, 64) > 2.15f);
-
-#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
-    if (is_cuda_available()) {
-        std::vector<float*> d_ptrs(num_frames, nullptr);
-        for (int f = 0; f < num_frames; ++f) {
-            cudaMalloc(&d_ptrs[f], stride * h * sizeof(float));
-            cudaMemcpy(d_ptrs[f], rgba_frames[f].data(), stride * h * sizeof(float), cudaMemcpyHostToDevice);
-        }
-        const float** d_frame_arr = nullptr;
-        cudaMalloc(&d_frame_arr, num_frames * sizeof(float*));
-        cudaMemcpy(d_frame_arr, d_ptrs.data(), num_frames * sizeof(float*), cudaMemcpyHostToDevice);
-        float* d_out = nullptr;
-        cudaMalloc(&d_out, stride * h * sizeof(float));
-
-        for (int eng = 0; eng < 4; ++eng) {
-            CudaDenoiseParams cp;
-            cp.width = w;
-            cp.height = h;
-            cp.stride_floats = stride;
-            cp.channels = 4;
-            cp.step_size = 4;
-            cp.engine_choice = eng;
+// Film-like noise: sigma proportional to value, independent per channel, mildly correlated spatially.
+std::vector<float> add_noise(const std::vector<float>& clean, int w, int h, float k, float floor, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> white(static_cast<size_t>(w) * h * 3);
+    for (auto& v : white) v = nd(rng);
+    std::vector<float> out = clean;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
             for (int c = 0; c < 3; ++c) {
-                cp.nlf_a[c] = auto_prof.nlf_per_channel[c].a;
-                cp.nlf_b[c] = auto_prof.nlf_per_channel[c].b;
-                for (int b = 0; b < 5; ++b) {
-                    cp.psd_weights[c][b] = auto_prof.psd.octave_weights[c][b];
-                }
+                const int x1 = std::min(x + 1, w - 1), y1 = std::min(y + 1, h - 1);
+                const float n = 0.5f * (white[(static_cast<size_t>(y) * w + x) * 3 + c] + white[(static_cast<size_t>(y) * w + x1) * 3 + c] +
+                                        white[(static_cast<size_t>(y1) * w + x) * 3 + c] + white[(static_cast<size_t>(y1) * w + x1) * 3 + c]);
+                const size_t o = (static_cast<size_t>(y) * w + x) * 4 + c;
+                const float v = std::max(clean[o], 0.0f);
+                out[o] = clean[o] + std::sqrt(floor * floor + k * k * v * v) * n;
             }
-
-            bool ok = cuda_denoise_device(d_frame_arr, num_frames, ref_idx, d_out, cp, nullptr);
-            LN_REQUIRE(ok);
-
-            std::vector<float> h_out(stride * h, 0.0f);
-            cudaMemcpy(h_out.data(), d_out, stride * h * sizeof(float), cudaMemcpyDeviceToHost);
-
-            VideoFrame32F gpu_frame(w, h, 3);
-            for (int y = 0; y < h; ++y) {
-                for (int x = 0; x < w; ++x) {
-                    for (int c = 0; c < 3; ++c) {
-                        float v = h_out[y * stride + x * 4 + c];
-                        LN_REQUIRE(std::isfinite(v) && v >= 0.0f);
-                        gpu_frame.channels[c].at(x, y) = v;
-                    }
-                }
-            }
-
-            double gpu_psnr = calc_psnr(gpu_frame);
-            std::cout << "  -> Engine " << eng << " GPU PSNR: " << gpu_psnr
-                      << " dB (Noisy: " << noisy_psnr << " dB, CPU V-BM3D: " << cpu_psnr << " dB)\n";
-            LN_REQUIRE(gpu_psnr > noisy_psnr + 6.5);
-            // Verify HDR > 1.0 highlight was NOT clipped or dimmed on GPU
-            LN_REQUIRE(gpu_frame.channels[0].at(120, 64) > 2.15f);
-        }
-
-        cudaFree(d_out);
-        cudaFree(d_frame_arr);
-        for (float* p : d_ptrs) cudaFree(p);
-        release_cuda_resources();
-    }
-#endif
-    std::cout << "  -> Passed: Correlated grain PSD, HDR > 1.0 preservation, and GPU/CPU parity verified.\n";
+    return out;
 }
 
-void test_cpu_cooperative_abort_and_all_engines() {
-    std::cout << "[Test] Running CPU cooperative abort and multi-engine test...\n";
-    const int w = 128;
-    const int h = 96;
-    std::vector<VideoFrame32F> seq(3, VideoFrame32F(w, h, 3));
-    for (int f = 0; f < 3; ++f) {
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                float clean = (x > 64) ? 0.65f : 0.25f;
-                float n = ((x * 23 + y * 41 + f * 67) % 100 - 50) * 0.0012f;
-                for (int c = 0; c < 3; ++c) seq[f].channels[c].at(x, y) = clean + n;
+double rmse(const std::vector<float>& a, const std::vector<float>& b, int w, int h, int margin = 16) {
+    double s = 0;
+    size_t n = 0;
+    for (int y = margin; y < h - margin; ++y)
+        for (int x = margin; x < w - margin; ++x)
+            for (int c = 0; c < 3; ++c) {
+                const size_t o = (static_cast<size_t>(y) * w + x) * 4 + c;
+                const double d = static_cast<double>(a[o]) - b[o];
+                s += d * d;
+                ++n;
             }
-        }
-    }
-
-    // Verify all 4 CPU engines complete cleanly with positive denoising
-    const DenoiseEngine engines[4] = {
-        DenoiseEngine::Collaborative3D,
-        DenoiseEngine::Wavelet5Band,
-        DenoiseEngine::NonLocalMeans,
-        DenoiseEngine::FrequencyDomain3D
-    };
-    for (DenoiseEngine eng : engines) {
-        VideoDenoiser::Config cfg;
-        cfg.temporal_radius = 1;
-        cfg.filter_params.engine = eng;
-        cfg.filter_params.max_threads = 4;
-        VideoDenoiser den(cfg);
-        VideoFrame32F out = den.process_window(seq);
-        LN_REQUIRE(out.is_valid());
-        LN_REQUIRE(std::isfinite(out.channels[0].at(32, 48)));
-        LN_REQUIRE(std::isfinite(out.channels[0].at(96, 48)));
-    }
-
-    // Verify cooperative abort cancels an in-flight CPU render immediately without crashing
-    struct AbortCounter {
-        int calls = 0;
-        static bool check(void* ud) {
-            auto* self = static_cast<AbortCounter*>(ud);
-            return (++self->calls >= 2);
-        }
-    } abort_ctx;
-
-    VideoDenoiser::Config abort_cfg;
-    abort_cfg.temporal_radius = 1;
-    abort_cfg.filter_params.abort_fn = &AbortCounter::check;
-    abort_cfg.filter_params.abort_user_data = &abort_ctx;
-    abort_cfg.filter_params.max_threads = 4;
-    VideoDenoiser abort_den(abort_cfg);
-    VideoFrame32F aborted_out = abort_den.process_window(seq);
-    LN_REQUIRE(aborted_out.is_valid());
-    LN_REQUIRE(abort_ctx.calls >= 2);
-    std::cout << "  -> Passed: All 4 CPU engines and cooperative abort verified.\n";
+    return std::sqrt(s / static_cast<double>(n));
 }
+
+} // namespace
 
 int main() {
-    std::cout << "--- Running LibreNoise Core Unit Tests ---\n";
-    test_variance_stabilization();
-    test_scene_cut_detection();
-    test_3d_collaborative_filtering();
-    test_roi_and_profiling();
-    test_profile_curve_spline();
-    test_profile_serialization();
-    test_motion_field_resilience();
-    test_gpu_cpu_correlated_grain_parity();
-    test_cpu_cooperative_abort_and_all_engines();
-    std::cout << "ALL TESTS PASSED SUCCESSFULLY!\n";
-    return 0;
+    const int W = 512, H = 384;
+    std::cout << "LibreNoise " << LIBRENOISE_VERSION_STRING << " core tests\n";
+
+    // -------------------------------------------------------------- transforms
+    {
+        NoiseModel m;
+        m.valid = true;
+        for (int c = 0; c < 3; ++c)
+            for (int q = 0; q < kCurveKnots; ++q) m.sigma[c][q] = std::sqrt(1e-6f + std::pow(0.05f * curve_knot_x(q), 2.0f));
+        auto lut = std::make_unique<VstLut>();
+        build_vst(m, *lut);
+        double worst = 0;
+        for (float x : {-0.01f, 0.0f, 1e-5f, 0.001f, 0.01f, 0.18f, 0.5f, 1.0f, 4.0f, 15.9f, 20.0f}) {
+            const float back = k::vst_inv(*lut, 1, k::vst_fwd(*lut, 1, x));
+            worst = std::max(worst, std::abs(static_cast<double>(back - x)) / std::max(1e-4, std::abs(static_cast<double>(x))));
+        }
+        check(worst < 2e-3, "VST forward/inverse round trip", "worst relative error " + fmt(worst));
+        const float x = 0.3f, dx = 1e-4f;
+        const float slope = (k::vst_fwd(*lut, 0, x + dx) - k::vst_fwd(*lut, 0, x - dx)) / (2 * dx);
+        const float expect = 1.0f / model_sigma_at(m, 0, x);
+        check(std::abs(slope / expect - 1.0f) < 0.02f, "VST slope = 1/sigma (unit noise after stabilisation)", fmt(slope) + " vs " + fmt(expect));
+        float Y, Cb, Cr, r, g, b;
+        k::rgb_to_work(*lut, 0.2f, 0.5f, 0.9f, Y, Cb, Cr);
+        k::work_to_rgb(*lut, Y, Cb, Cr, r, g, b);
+        check(std::abs(r - 0.2f) < 1e-3f && std::abs(g - 0.5f) < 1e-3f && std::abs(b - 0.9f) < 2e-3f, "Y/Cb/Cr round trip");
+        float in[64], co[64], back[64];
+        for (int i = 0; i < 64; ++i) in[i] = std::sin(i * 0.7f);
+        k::dct8x8(in, co);
+        k::idct8x8(co, back);
+        double e = 0;
+        for (int i = 0; i < 64; ++i) e = std::max(e, static_cast<double>(std::abs(back[i] - in[i])));
+        check(e < 1e-5, "8x8 DCT round trip", fmt(e));
+    }
+
+    // -------------------------------------------------------------- profiler on synthetic film-like noise
+    const auto clean = make_scene(W, H);
+    const auto noisy = add_noise(clean, W, H, 0.06f, 0.0005f, 1);
+    const NoiseModel model = estimate_noise_model(FrameView{noisy.data(), W * 4, 4}, W, H);
+    check(model.valid, "profiler produced a model", model.summary());
+    check(model.fit_exponent[1] > 0.75f && model.fit_exponent[1] < 1.2f, "noise exponent ~1 for value-proportional noise", fmt(model.fit_exponent[1]));
+    check(model.detected_type == SourceType::Film, "independent per-channel noise detected as film", source_type_name(model.detected_type));
+    check(model.grid_phase_x < 0 && model.grid_phase_y < 0, "no compression grid on clean synthetic noise");
+    {
+        NoiseModel back;
+        check(NoiseModel::deserialize(model.serialize(), back) && back.valid &&
+              std::abs(back.level_sigma[2][0][9] - model.level_sigma[2][0][9]) < 1e-5f, "model serialise round trip");
+        const auto path = (std::filesystem::temp_directory_path() / "librenoise_test.lnp").string();
+        ProfileFile pf;
+        pf.device_name = "Test cam";
+        pf.model = model;
+        ProfileFile pl;
+        check(save_profile(path, pf) && load_profile(path, pl) && pl.device_name == "Test cam" && pl.model.valid, ".lnp v2 save/load");
+        std::filesystem::remove(path);
+    }
+
+    // -------------------------------------------------------------- pipeline identity (all amounts 0)
+    {
+        Params p;
+        p.temporal_radius = 0;
+        for (float& a : p.amount_band) a = 0.0f;
+        std::vector<float> out(noisy.size());
+        const FrameView v{noisy.data(), W * 4, 4};
+        const bool ok = denoise_cpu(&v, 1, 0, W, H, model, p, OutputView{out.data(), W * 4, 4});
+        check(ok && rmse(out, noisy, W, H, 0) < 2e-4, "amount 0 reproduces the input", fmt(rmse(out, noisy, W, H, 0)));
+    }
+
+    // -------------------------------------------------------------- spatial denoising
+    {
+        Params p;
+        p.temporal_radius = 0;
+        std::vector<float> spatial(noisy.size());
+        const FrameView v{noisy.data(), W * 4, 4};
+        const bool ok = denoise_cpu(&v, 1, 0, W, H, model, p, OutputView{spatial.data(), W * 4, 4});
+        const double before = rmse(noisy, clean, W, H), after = rmse(spatial, clean, W, H);
+        check(ok && after < 0.5 * before, "spatial filter removes most noise", fmt(before) + " -> " + fmt(after));
+    }
+
+    // -------------------------------------------------------------- temporal denoising + repeated frames
+    {
+        std::vector<std::vector<float>> frames;
+        for (unsigned s = 0; s < 5; ++s) frames.push_back(add_noise(clean, W, H, 0.06f, 0.0005f, 10 + s));
+        std::vector<FrameView> views;
+        for (auto& f : frames) views.push_back(FrameView{f.data(), W * 4, 4});
+        Params p;
+        p.temporal_radius = 2;
+        std::vector<float> outT(noisy.size()), out0(noisy.size()), outDup(noisy.size());
+        denoise_cpu(views.data(), 5, 2, W, H, model, p, OutputView{outT.data(), W * 4, 4});
+        p.temporal_radius = 0;
+        denoise_cpu(&views[2], 1, 0, W, H, model, p, OutputView{out0.data(), W * 4, 4});
+        const double eT = rmse(outT, clean, W, H), e0 = rmse(out0, clean, W, H);
+        check(eT < 0.85 * e0, "temporal radius 2 beats spatial only on a static scene", fmt(e0) + " -> " + fmt(eT));
+        std::vector<FrameView> dup(5, views[2]);
+        p.temporal_radius = 2;
+        denoise_cpu(dup.data(), 5, 2, W, H, model, p, OutputView{outDup.data(), W * 4, 4});
+        check(rmse(outDup, out0, W, H, 0) < 1e-6, "repeated frames are not counted as new samples", fmt(rmse(outDup, out0, W, H, 0)));
+
+        // moving scene: 3 px per frame; temporal must still help (motion compensation)
+        std::vector<std::vector<float>> mv;
+        for (int i = 0; i < 5; ++i) {
+            std::vector<float> shifted(clean.size());
+            const int dx = (i - 2) * 3;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int c = 0; c < 4; ++c)
+                        shifted[(static_cast<size_t>(y) * W + x) * 4 + c] = clean[(static_cast<size_t>(y) * W + std::clamp(x + dx, 0, W - 1)) * 4 + c];
+            mv.push_back(add_noise(shifted, W, H, 0.06f, 0.0005f, 40 + i));
+        }
+        std::vector<FrameView> mviews;
+        for (auto& f : mv) mviews.push_back(FrameView{f.data(), W * 4, 4});
+        std::vector<float> outM(noisy.size()), outM0(noisy.size());
+        denoise_cpu(mviews.data(), 5, 2, W, H, model, p, OutputView{outM.data(), W * 4, 4});
+        p.temporal_radius = 0;
+        denoise_cpu(&mviews[2], 1, 0, W, H, model, p, OutputView{outM0.data(), W * 4, 4});
+        const double m0 = rmse(outM0, clean, W, H, 24), mT = rmse(outM, clean, W, H, 24);
+        check(mT < 0.9 * m0, "motion-compensated temporal helps on a moving scene", fmt(m0) + " -> " + fmt(mT));
+
+#if defined(LIBRENOISE_HAS_CUDA) && (LIBRENOISE_HAS_CUDA != 0)
+        if (cuda_available()) {
+            p.temporal_radius = 2;
+            const size_t bytes = clean.size() * sizeof(float);
+            std::vector<float*> d(5, nullptr);
+            std::vector<FrameView> dv;
+            for (int i = 0; i < 5; ++i) {
+                cudaMalloc(&d[i], bytes);
+                cudaMemcpy(d[i], mv[i].data(), bytes, cudaMemcpyHostToDevice);
+                dv.push_back(FrameView{d[i], W * 4, 4});
+            }
+            float* dout = nullptr;
+            cudaMalloc(&dout, bytes);
+            const bool ok = denoise_cuda(dv.data(), 5, 2, W, H, model, p, OutputView{dout, W * 4, 4});
+            std::vector<float> outG(clean.size());
+            cudaMemcpy(outG.data(), dout, bytes, cudaMemcpyDeviceToHost);
+            cudaFree(dout);
+            for (float* q : d) cudaFree(q);
+            const double diff = rmse(outG, outM, W, H, 0);
+            check(ok && diff < 1e-4, "CUDA matches CPU", "rms difference " + fmt(diff));
+        } else {
+            std::cout << "  SKIP  CUDA parity (no compute 8.6+ device)\n";
+        }
+#endif
+    }
+
+    // -------------------------------------------------------------- compression grid detection
+    {
+        std::vector<float> blocky = add_noise(clean, W, H, 0.02f, 0.0005f, 77);
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> ud(-0.01f, 0.01f);
+        for (int by = 0; by < H / 8; ++by)
+            for (int bx = 0; bx < W / 8; ++bx) {
+                const float off = ud(rng);
+                for (int y = 0; y < 8; ++y)
+                    for (int x = 0; x < 8; ++x)
+                        for (int c = 0; c < 3; ++c) {
+                            const size_t o = (static_cast<size_t>(by * 8 + y) * W + bx * 8 + x) * 4 + c;
+                            blocky[o] += off * (0.2f + clean[o]);
+                        }
+            }
+        const NoiseModel bm = estimate_noise_model(FrameView{blocky.data(), W * 4, 4}, W, H);
+        check(bm.grid_phase_x == 7 && bm.grid_phase_y == 7, "8x8 block grid detected at the right phase",
+              "phase " + std::to_string(bm.grid_phase_x) + "," + std::to_string(bm.grid_phase_y) + " strength " + fmt(bm.compression));
+    }
+
+    std::cout << (g_failures == 0 ? "ALL TESTS PASSED\n" : "TESTS FAILED: " + std::to_string(g_failures) + "\n");
+    return g_failures == 0 ? 0 : 1;
 }

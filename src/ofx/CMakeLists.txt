@@ -32,7 +32,7 @@ endif()
 set_target_properties(librenoise_ofx PROPERTIES
     PREFIX ""
     SUFFIX ".ofx"
-    OUTPUT_NAME "LibreNoise"
+    OUTPUT_NAME "LibreNoise_v02"
 )
 
 # OpenFX standard bundle packaging
@@ -44,11 +44,11 @@ else()
     set(OFX_ARCH "Linux-x86-64")
 endif()
 
-set(BUNDLE_DIR "${CMAKE_BINARY_DIR}/LibreNoise.ofx.bundle/Contents/${OFX_ARCH}")
+set(BUNDLE_DIR "${CMAKE_BINARY_DIR}/LibreNoise_v02.ofx.bundle/Contents/${OFX_ARCH}")
 
 add_custom_command(TARGET librenoise_ofx POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:librenoise_ofx>" "${BUNDLE_DIR}/LibreNoise.ofx"
+    COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:librenoise_ofx>" "${BUNDLE_DIR}/LibreNoise_v02.ofx"
     COMMENT "Packaging LibreNoise into standard OpenFX bundle (${BUNDLE_DIR})"
 )
 

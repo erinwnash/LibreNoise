@@ -1,46 +1,47 @@
 find_package(OpenMP)
 
 set(CORE_SOURCES
-    noise_model.cpp
-    alignment.cpp
-    filter.cpp
-    detail.cpp
-    core_pipeline.cpp
-    roi_analyzer.cpp
-    profile_curve.cpp
-    profile_io.cpp
+    v2/model.cpp
+    v2/profiler.cpp
+    v2/backend_cpu.cpp
+    v2/profile_io.cpp
 )
 
 if(LIBRENOISE_HAS_CUDA)
     set(CUDA_NVCC_EXECUTABLE "${CUDAToolkit_BIN_DIR}/nvcc.exe")
-    set(CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/denoise_cuda.obj")
+    set(CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/backend_cuda.obj")
 
     add_custom_command(
         OUTPUT ${CUDA_OBJ}
         COMMAND ${CUDA_NVCC_EXECUTABLE}
-            -c ${CMAKE_CURRENT_SOURCE_DIR}/gpu/denoise_cuda.cu
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/v2/backend_cuda.cu
             -o ${CUDA_OBJ}
             -O3
+            -std=c++20
+            --extended-lambda
+            --use_fast_math
             -allow-unsupported-compiler
             -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
             -arch=sm_86
-            -Xcompiler="/MD"
+            -Xcompiler="/MD /O2"
             -ccbin "${CMAKE_CXX_COMPILER}"
             -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/v2
             -I${CUDAToolkit_INCLUDE_DIRS}
         DEPENDS
-            ${CMAKE_CURRENT_SOURCE_DIR}/gpu/denoise_cuda.cu
-            ${CMAKE_CURRENT_SOURCE_DIR}/../../include/librenoise/gpu_denoiser.hpp
-        COMMENT "Compiling CUDA GPU kernels (sm_86 Ampere)"
+            ${CMAKE_CURRENT_SOURCE_DIR}/v2/backend_cuda.cu
+            ${CMAKE_CURRENT_SOURCE_DIR}/v2/pipeline_impl.inl
+            ${CMAKE_CURRENT_SOURCE_DIR}/v2/kernels.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include/librenoise/v2/model.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include/librenoise/v2/pipeline.hpp
+        COMMENT "Compiling LibreNoise v0.2 CUDA back end (sm_86)"
     )
     list(APPEND CORE_SOURCES ${CUDA_OBJ})
 else()
-    list(APPEND CORE_SOURCES gpu/denoise_cuda_stub.cpp)
+    list(APPEND CORE_SOURCES v2/backend_cuda_stub.cpp)
 endif()
 
-add_library(librenoise_core STATIC
-    ${CORE_SOURCES}
-)
+add_library(librenoise_core STATIC ${CORE_SOURCES})
 
 target_include_directories(librenoise_core
     PUBLIC
@@ -51,9 +52,9 @@ target_include_directories(librenoise_core
 target_compile_features(librenoise_core PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(librenoise_core PRIVATE /W4 /arch:AVX2 /fp:fast /openmp)
+    target_compile_options(librenoise_core PRIVATE /W4 /arch:AVX2 /fp:fast /openmp /O2)
 else()
-    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -mavx2 -mfma -ffast-math -fopenmp)
+    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -mavx2 -mfma -ffast-math -fopenmp -O3)
 endif()
 
 if(OpenMP_CXX_FOUND)

@@ -1,6 +1,6 @@
-# LibreNoise: Feature Parity
+# LibreNoise v0.2: Feature Status
 
-Source: `docs/reference/` (sections 1.2, 5.5-5.8, 6, 7, 8, 10). Compared against v0.2.
+Compared against the feature set common to professional denoising tools.
 Legend: **Have** = implemented, **Partial** = exists but weaker or differently shaped, **Missing** = not implemented.
 
 ## Profiling

@@ -64,5 +64,5 @@ ctest --test-dir build -C Release --output-on-failure
 ## Docs
 
 - [v0.2 design and test results](docs/V0_2_DESIGN.md)
-- [Feature parity](docs/FEATURE_PARITY.md)
+- [Feature status](docs/FEATURES.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)

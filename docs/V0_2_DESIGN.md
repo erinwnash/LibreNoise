@@ -89,6 +89,6 @@ tiling the spatial stage so a tile's pyramid stays in cache.
 
 ## Not done yet
 
-- Artifact Removal for residual dot / line noise, dust and scratches, jitter of details.
+- Artifact Removal for residual dot / line noise (dot / line residue), dust and scratches, jitter of details.
 - Adapting to changing noise inside a clip (the profile is measured once).
 - Caching motion between renders, and OpenCL.

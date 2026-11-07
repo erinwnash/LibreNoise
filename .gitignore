@@ -37,3 +37,17 @@ MinSizeRel/
 *.yuv
 test_output/
 benchmark_results/
+
+# Third-party documents and test media stay out of the repository
+docs/reference/
+testMedia/
+*.exr
+*.dpx
+*.dnp
+*.lnm
+*.tif
+*.tiff
+*.mov
+*.mp4
+*.mxf
+*.cin

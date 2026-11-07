@@ -68,7 +68,6 @@ PF_Err handle_about(PF_InData* in_data, PF_OutData* out_data) {
         std::strncpy(out_data->return_msg,
             "LibreNoise Video Denoiser v0.2.0\n"
             "Open-source production-grade temporal & spatial video denoiser.\n"
-            "Interactive noise profiling workflow.\n"
             "Accelerated via CUDA sm_86 & AVX2.",
             sizeof(out_data->return_msg) - 1);
     }

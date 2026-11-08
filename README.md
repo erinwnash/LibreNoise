@@ -66,3 +66,19 @@ ctest --test-dir build -C Release --output-on-failure
 - [v0.2 design and test results](docs/V0_2_DESIGN.md)
 - [Feature status](docs/FEATURES.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+## Support
+
+This project is value for value, which means it is FOSS, but if there is any value you find in it I would be glad to get value back in return.
+
+Said value takes the form of three Ts per the model created by Adam Curry:
+
+Time, Talent, or Treasure
+
+You can donate time to this project and my others by testing it, giving feedback and suggestions, and letting me know how it is useful or less than useful to you.
+
+You can share talent with this project and my others by engaging in work on improving it, in your own fork or via communication. If you see glaring errors or major bugs you know how to fix please let me know.
+
+You can donate treasure to this project and my others on ko-fi. If you find this project or my others have any value to you just give whatever feels right. That number will be different for everyone, and for some not possible at all, and that is ok, please see the first two Ts for how to give back.
+
+https://ko-fi.com/erinwnash

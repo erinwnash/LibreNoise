@@ -425,9 +425,10 @@ OfxStatus action_describe_in_context(OfxImageEffectHandle effect, OfxPropertySet
     d.integer(kParamTemporalRadius, "Radius (frames each side)", kGroupTemporal, 2, 0, 5,
               "Frames used on each side of the current one. 2 = 5 frames total (default). Higher cleans static areas more "
               "and reduces boiling; costs render time and memory. 0 = spatial only.");
-    d.dbl(kParamTemporalStrength, "Temporal Strength", kGroupTemporal, 1.0, 0.0, 2.0, 0.0, 4.0,
+    d.dbl(kParamTemporalStrength, "Temporal Strength", kGroupTemporal, 0.75, 0.0, 2.0, 0.0, 4.0,
           "How different a matched pixel may be and still be averaged. Lower if moving objects smear or ghost; raise if "
-          "static areas still flicker.");
+          "static areas still flicker. Warning: values above the 0.75 default average more aggressively and can "
+          "introduce blocky or mismatched patches around moving edges (shoulders, hair).");
     d.dbl(kParamFlicker, "Flicker Reduction", kGroupTemporal, 0.0, 0.0, 1.0, 0.0, 1.0,
           "Ignore slow brightness changes between frames when matching, so frame-to-frame flicker is averaged out "
           "together with the noise. 0 = off.");
@@ -650,7 +651,7 @@ OfxStatus action_instance_changed(OfxImageEffectHandle effect, OfxPropertySetHan
 v2::Params read_params(OfxParamSetHandle ps, double t) {
     v2::Params P;
     P.temporal_radius = std::clamp(get_int(ps, kParamTemporalRadius, t, 2), 0, 5);
-    P.temporal_strength = static_cast<float>(get_double(ps, kParamTemporalStrength, t, 1.0));
+    P.temporal_strength = static_cast<float>(get_double(ps, kParamTemporalStrength, t, 0.75));
     P.flicker_reduction = static_cast<float>(get_double(ps, kParamFlicker, t, 0.0));
     P.skip_repeated_frames = get_int(ps, kParamRepeatedFrames, t, 1) != 0;
     P.amount_channel[0] = static_cast<float>(get_double(ps, kParamAmountY, t, 1.0));

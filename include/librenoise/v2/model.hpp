@@ -98,7 +98,7 @@ float model_sigma_at(const NoiseModel& model, int channel, float x) noexcept;
 // Processing parameters. Frequency arrays are indexed High, Mid, Low, VeryLow, UltraLow.
 struct Params {
     int32_t temporal_radius = 2;           // frames each side, 0..5
-    float temporal_strength = 1.0f;        // tolerance of the temporal match (higher = more averaging)
+    float temporal_strength = 0.75f;       // tolerance of the temporal match (higher = more averaging)
     float flicker_reduction = 0.0f;        // 0..1: ignore slow brightness changes when matching (smooths flicker)
     bool skip_repeated_frames = true;      // exact duplicate frames do not count as new samples
 

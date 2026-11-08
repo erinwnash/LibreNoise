@@ -189,12 +189,24 @@ double temporal_accumulate(B& be, int w, int h, const float* refY, const float* 
                            const float* const cand[3], const float* v0,
                            float* W[3], float* dd, float* tmp, float* tmp2, float* acc[3], float* wsum, float* w2sum,
                            float sigmaY, float sigmaCb, float sigmaCr, float strength, float flicker) {
-    const int nbx = (w + 7) / 8;
+    const int nbx = (w + 7) / 8, nby = (h + 7) / 8;
     const float* c0 = cand[0]; const float* c1 = cand[1]; const float* c2 = cand[2];
     float* w0 = W[0]; float* w1 = W[1]; float* w2 = W[2];
     be.for2d(w, h, LN_LAMBDA(int x, int y) {
-        const size_t bi = (static_cast<size_t>(y >> 3) * nbx + (x >> 3)) * 2;
-        const float sx = static_cast<float>(x) + v0[bi], sy = static_cast<float>(y) + v0[bi + 1];
+        // Interpolate the vector field between block centres so neighbouring blocks with slightly different
+        // vectors do not leave visible block seams in the average.
+        const float fx = (static_cast<float>(x) - 3.5f) * 0.125f, fy = (static_cast<float>(y) - 3.5f) * 0.125f;
+        const int bx0 = static_cast<int>(floorf(fx)), by0 = static_cast<int>(floorf(fy));
+        const float tx = fx - static_cast<float>(bx0), ty = fy - static_cast<float>(by0);
+        const int xa = bx0 < 0 ? 0 : bx0, xb = bx0 + 1 > nbx - 1 ? nbx - 1 : bx0 + 1;
+        const int ya = by0 < 0 ? 0 : by0, yb = by0 + 1 > nby - 1 ? nby - 1 : by0 + 1;
+        const float* va = v0 + (static_cast<size_t>(ya) * nbx + xa) * 2;
+        const float* vb = v0 + (static_cast<size_t>(ya) * nbx + xb) * 2;
+        const float* vc = v0 + (static_cast<size_t>(yb) * nbx + xa) * 2;
+        const float* vd = v0 + (static_cast<size_t>(yb) * nbx + xb) * 2;
+        const float mx = (va[0] * (1.0f - tx) + vb[0] * tx) * (1.0f - ty) + (vc[0] * (1.0f - tx) + vd[0] * tx) * ty;
+        const float my = (va[1] * (1.0f - tx) + vb[1] * tx) * (1.0f - ty) + (vc[1] * (1.0f - tx) + vd[1] * tx) * ty;
+        const float sx = static_cast<float>(x) + mx, sy = static_cast<float>(y) + my;
         const size_t i = static_cast<size_t>(y) * w + x;
         w0[i] = k::sample_bilinear(c0, w, h, sx, sy);
         w1[i] = k::sample_bilinear(c1, w, h, sx, sy);

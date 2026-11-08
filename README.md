@@ -49,12 +49,12 @@ Pre-built OpenFX bundles are on the [Releases page](https://github.com/erinwnash
 | Platform | Status | Install the `LibreNoise_v02.ofx.bundle` folder into |
 |---|---|---|
 | Windows 64-bit (CPU + NVIDIA CUDA) | Released | `C:\Program Files\Common Files\OFX\Plugins` (admin rights needed) |
-| Linux x86-64 | Builds and passes the tests on Ubuntu 22.04 (CPU only); not yet tried inside a host; not yet released | `/usr/OFX/Plugins` |
-| macOS (Apple Silicon, Intel) | Build files prepared; not yet built or tested | `/Library/OFX/Plugins` |
+| Linux x86-64 | Experimental (CPU only): builds and passes the tests in CI; not yet tried inside a host | `/usr/OFX/Plugins` |
+| macOS (Apple Silicon, Intel) | Experimental (CPU only, unsigned): builds and passes the tests in CI; not yet tried inside a host | `/Library/OFX/Plugins` |
 
 The Windows release includes the CUDA runtime DLL, so it needs only a recent NVIDIA driver (RTX 30-series or newer
-for the GPU path; otherwise it runs on the CPU). Linux and macOS builds are CPU-only; the macOS and Linux build is
-set up in `.github/workflows/build.yml`, which can be run by hand from the Actions tab.
+for the GPU path; otherwise it runs on the CPU). Linux and macOS builds are CPU-only and come from `.github/workflows/build.yml`, which can be run by hand from
+the Actions tab. Each zip has an `INSTALL.txt`; the macOS bundles are unsigned (see it for the `xattr` step).
 
 ---
 

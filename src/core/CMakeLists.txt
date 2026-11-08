@@ -8,8 +8,15 @@ set(CORE_SOURCES
 )
 
 if(LIBRENOISE_HAS_CUDA)
-    set(CUDA_NVCC_EXECUTABLE "${CUDAToolkit_BIN_DIR}/nvcc.exe")
-    set(CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/backend_cuda.obj")
+    if(WIN32)
+        set(CUDA_NVCC_EXECUTABLE "${CUDAToolkit_BIN_DIR}/nvcc.exe")
+        set(CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/backend_cuda.obj")
+        set(CUDA_HOST_FLAGS "-Xcompiler=/MD,/O2" -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+    else()
+        set(CUDA_NVCC_EXECUTABLE "${CUDAToolkit_BIN_DIR}/nvcc")
+        set(CUDA_OBJ "${CMAKE_CURRENT_BINARY_DIR}/backend_cuda.o")
+        set(CUDA_HOST_FLAGS "-Xcompiler=-fPIC,-O3")
+    endif()
 
     add_custom_command(
         OUTPUT ${CUDA_OBJ}
@@ -21,9 +28,8 @@ if(LIBRENOISE_HAS_CUDA)
             --extended-lambda
             --use_fast_math
             -allow-unsupported-compiler
-            -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR
             -arch=sm_86
-            -Xcompiler="/MD /O2"
+            ${CUDA_HOST_FLAGS}
             -ccbin "${CMAKE_CXX_COMPILER}"
             -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
             -I${CMAKE_CURRENT_SOURCE_DIR}/v2
@@ -54,7 +60,10 @@ target_compile_features(librenoise_core PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_options(librenoise_core PRIVATE /W4 /arch:AVX2 /fp:fast /openmp /O2)
 else()
-    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -mavx2 -mfma -ffast-math -fopenmp -O3)
+    target_compile_options(librenoise_core PRIVATE -Wall -Wextra -ffast-math -O3)
+    if(LIBRENOISE_X86)
+        target_compile_options(librenoise_core PRIVATE -mavx2 -mfma)
+    endif()
 endif()
 
 if(OpenMP_CXX_FOUND)

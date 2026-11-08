@@ -1,0 +1,59 @@
+name: Build OFX bundles
+
+# Manual or tag-triggered: builds the CPU-only OpenFX bundle for each platform and uploads it as an artifact.
+# The Windows CUDA build is made locally (CI runners have no CUDA toolkit); see the README.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-22.04 }
+          - { name: macos-arm64,  os: macos-14 }
+          - { name: macos-x86_64, os: macos-13 }
+          - { name: windows-x64,  os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev
+
+      - name: Install OpenMP (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Configure
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            LIBOMP="$(brew --prefix libomp)"
+            EXTRA="-DOpenMP_CXX_FLAGS=-Xpreprocessor -fopenmp -I${LIBOMP}/include -DOpenMP_CXX_LIB_NAMES=omp -DOpenMP_omp_LIBRARY=${LIBOMP}/lib/libomp.dylib"
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLIBRENOISE_BUILD_AE=OFF ${EXTRA:+"$EXTRA"}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package bundle
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -R build/LibreNoise_v02.ofx.bundle dist/
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
+          cd dist && 7z a -tzip "../LibreNoise-${{ matrix.name }}.zip" . >/dev/null 2>&1 || zip -r "../LibreNoise-${{ matrix.name }}.zip" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LibreNoise-${{ matrix.name }}
+          path: LibreNoise-${{ matrix.name }}.zip

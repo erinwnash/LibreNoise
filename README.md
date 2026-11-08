@@ -42,6 +42,22 @@ See [`PROVENANCE.md`](PROVENANCE.md) for detailed citations, origin tracking, an
 
 ---
 
+## Download
+
+Pre-built OpenFX bundles are on the [Releases page](https://github.com/erinwnash/LibreNoise/releases/latest).
+
+| Platform | Status | Install the `LibreNoise_v02.ofx.bundle` folder into |
+|---|---|---|
+| Windows 64-bit (CPU + NVIDIA CUDA) | Released | `C:\Program Files\Common Files\OFX\Plugins` (admin rights needed) |
+| Linux x86-64 | Build files prepared; not yet built or tested | `/usr/OFX/Plugins` |
+| macOS (Apple Silicon, Intel) | Build files prepared; not yet built or tested | `/Library/OFX/Plugins` |
+
+The Windows release includes the CUDA runtime DLL, so it needs only a recent NVIDIA driver (RTX 30-series or newer
+for the GPU path; otherwise it runs on the CPU). Linux and macOS builds are CPU-only; the macOS and Linux build is
+set up in `.github/workflows/build.yml`, which can be run by hand from the Actions tab.
+
+---
+
 ## Building from Source
 
 ### Prerequisites
@@ -60,6 +76,21 @@ cmake --build build --config Release
 # Run Unit Tests & Benchmark Harness
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+### Linux and macOS
+
+```bash
+# Linux: sudo apt install build-essential cmake libgl1-mesa-dev
+# macOS: brew install cmake libomp  (add -DOpenMP_CXX_FLAGS / -DOpenMP_omp_LIBRARY, see .github/workflows/build.yml)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLIBRENOISE_BUILD_AE=OFF
+cmake --build build --parallel
+ctest --test-dir build
+# bundle: build/LibreNoise_v02.ofx.bundle
+```
+
+x86-64 uses the AVX2 kernels; Apple Silicon and other CPUs use the scalar kernels (same results, slower). Build each
+macOS architecture separately; a universal binary is not supported. CUDA builds on Linux need the CUDA Toolkit and a
+GPU of compute capability 8.6 or newer; macOS has no CUDA.
 
 ## Docs
 

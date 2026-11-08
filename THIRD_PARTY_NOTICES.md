@@ -22,3 +22,8 @@ Components bundled in this repository that were not written for LibreNoise.
 - Source: Academy Software Foundation OpenFX
 - License: BSD-3-Clause
 - Used by: the OFX plug-in.
+
+## NVIDIA CUDA runtime (Windows release only)
+- File: `cudart64_12.dll`, shipped inside the Windows release bundle so the GPU path works without a CUDA install.
+- Source: NVIDIA CUDA Toolkit 12.8, redistributable component listed in the CUDA EULA (Attachment A).
+- License: NVIDIA CUDA Toolkit EULA (redistribution permitted for the listed runtime files). Not part of the source tree.

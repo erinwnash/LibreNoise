@@ -9,7 +9,10 @@ target_compile_features(librenoise_ofx PRIVATE cxx_std_20)
 if(MSVC)
     target_compile_options(librenoise_ofx PRIVATE /arch:AVX2 /fp:fast /openmp)
 else()
-    target_compile_options(librenoise_ofx PRIVATE -mavx2 -mfma -ffast-math -fopenmp)
+    target_compile_options(librenoise_ofx PRIVATE -ffast-math)
+    if(LIBRENOISE_X86)
+        target_compile_options(librenoise_ofx PRIVATE -mavx2 -mfma)
+    endif()
 endif()
 
 if(WIN32)
@@ -45,6 +48,22 @@ else()
 endif()
 
 set(BUNDLE_DIR "${CMAKE_BINARY_DIR}/LibreNoise_v02.ofx.bundle/Contents/${OFX_ARCH}")
+
+if(APPLE)
+    # A macOS OpenFX bundle needs an Info.plist next to the Contents/MacOS binary.
+    file(WRITE "${CMAKE_BINARY_DIR}/LibreNoise_v02.ofx.bundle/Contents/Info.plist"
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+  <key>CFBundleExecutable</key><string>LibreNoise_v02.ofx</string>
+  <key>CFBundleIdentifier</key><string>org.librenoise.denoiser_v02</string>
+  <key>CFBundleName</key><string>LibreNoise_v02</string>
+  <key>CFBundlePackageType</key><string>BNDL</string>
+  <key>CFBundleShortVersionString</key><string>${PROJECT_VERSION}</string>
+  <key>CFBundleVersion</key><string>${PROJECT_VERSION}</string>
+</dict></plist>
+")
+endif()
 
 add_custom_command(TARGET librenoise_ofx POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_DIR}"

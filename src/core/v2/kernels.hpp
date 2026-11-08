@@ -407,6 +407,39 @@ LN_HD float sample_bilinear(const float* p, int w, int h, float x, float y) {
     return (a + (b - a) * ax) * (1.0f - ay) + (c + (d - c) * ax) * ay;
 }
 
+// Catmull-Rom bicubic sample. Used for the motion-compensated planes: bilinear resampling is a low-pass filter and
+// averaging several bilinear-resampled frames visibly softens fine detail (hair, fabric weave).
+LN_HD void cr_weights(float t, float* w) {
+    const float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f * t3 + t2 - 0.5f * t;
+    w[1] = 1.5f * t3 - 2.5f * t2 + 1.0f;
+    w[2] = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+    w[3] = 0.5f * t3 - 0.5f * t2;
+}
+
+LN_HD float sample_bicubic(const float* p, int w, int h, float x, float y) {
+    const float fx = floorf(x), fy = floorf(y);
+    const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
+    const float ax = x - fx, ay = y - fy;
+    if (ax < 1e-4f && ay < 1e-4f) return sample_clamped(p, w, h, x0, y0);
+    float wx[4], wy[4];
+    cr_weights(ax, wx); cr_weights(ay, wy);
+    float acc = 0.0f;
+    if (x0 >= 1 && y0 >= 1 && x0 + 2 < w && y0 + 2 < h) {
+        for (int j = 0; j < 4; ++j) {
+            const float* r = p + static_cast<size_t>(y0 - 1 + j) * w + (x0 - 1);
+            acc += wy[j] * (wx[0] * r[0] + wx[1] * r[1] + wx[2] * r[2] + wx[3] * r[3]);
+        }
+    } else {
+        for (int j = 0; j < 4; ++j) {
+            float row = 0.0f;
+            for (int i = 0; i < 4; ++i) row += wx[i] * sample_clamped(p, w, h, x0 - 1 + i, y0 - 1 + j);
+            acc += wy[j] * row;
+        }
+    }
+    return acc;
+}
+
 // SAD of 8x8 block at (bx, by) in ref against cand displaced by integer (dx, dy). row_step 1 or 2.
 LN_HD float block_sad(const float* ref, const float* cand, int w, int h, int bx, int by, int dx, int dy, int row_step) {
     float s = 0.0f;

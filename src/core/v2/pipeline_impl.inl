@@ -208,9 +208,9 @@ double temporal_accumulate(B& be, int w, int h, const float* refY, const float* 
         const float my = (va[1] * (1.0f - tx) + vb[1] * tx) * (1.0f - ty) + (vc[1] * (1.0f - tx) + vd[1] * tx) * ty;
         const float sx = static_cast<float>(x) + mx, sy = static_cast<float>(y) + my;
         const size_t i = static_cast<size_t>(y) * w + x;
-        w0[i] = k::sample_bilinear(c0, w, h, sx, sy);
-        w1[i] = k::sample_bilinear(c1, w, h, sx, sy);
-        w2[i] = k::sample_bilinear(c2, w, h, sx, sy);
+        w0[i] = k::sample_bicubic(c0, w, h, sx, sy);
+        w1[i] = k::sample_bicubic(c1, w, h, sx, sy);
+        w2[i] = k::sample_bicubic(c2, w, h, sx, sy);
         dd[i] = refY[i] - w0[i];
     });
     if (flicker > 0.0f) {

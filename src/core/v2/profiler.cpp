@@ -20,6 +20,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <vector>

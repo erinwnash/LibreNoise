@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // LibreNoise v0.2 core tests. Plain executable: prints each check and returns non-zero on any failure.
 #include "librenoise/librenoise.hpp"
 #include "../src/core/v2/kernels.hpp"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "ofx_interact.hpp"
 #include "openfx/ofxCore.h"
 #include "openfx/ofxProperty.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // .lnp v2 profile files: a small text header (device / mode labels) followed by the serialised NoiseModel.
 

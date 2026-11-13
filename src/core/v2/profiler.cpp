@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // LibreNoise v0.2 noise profiler: measures the noise model from a single frame. Pure algorithm.
 //
 //  1. Brightness curve. The frame is cut into 16x16 blocks; for each channel the high-pass std of every

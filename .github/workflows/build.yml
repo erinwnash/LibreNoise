@@ -50,7 +50,7 @@ jobs:
         run: |
           mkdir -p dist
           cp -R build/LibreNoise_v02.ofx.bundle dist/
-          cp LICENSE THIRD_PARTY_NOTICES.md dist/
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dist/
           cd dist && 7z a -tzip "../LibreNoise-${{ matrix.name }}.zip" . >/dev/null 2>&1 || zip -r "../LibreNoise-${{ matrix.name }}.zip" .
 
       - uses: actions/upload-artifact@v5

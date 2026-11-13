@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Per-pixel and per-block kernels shared by the CPU (MSVC/OpenMP) and CUDA (nvcc) back ends.
 // Every function here is a pure function of its inputs so the two back ends produce the same result.

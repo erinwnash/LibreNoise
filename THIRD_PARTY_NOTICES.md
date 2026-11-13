@@ -1,3 +1,5 @@
+LibreNoise itself is licensed under the Apache License 2.0 (see `LICENSE` and `NOTICE`). The components below are third-party and keep their own licenses.
+
 # Third-Party Notices
 
 Components bundled in this repository that were not written for LibreNoise.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Score denoiser renders against the source and a reference render (for example another denoiser).
 
 No reference images are stored in the repository; point the script at your own frames.

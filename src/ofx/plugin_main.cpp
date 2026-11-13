@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // LibreNoise v0.2 OpenFX plug-in.
 //
 // Identity is new for v0.2 (org.librenoise.denoiser_v02, bundle LibreNoise_v02.ofx.bundle) so it installs next to

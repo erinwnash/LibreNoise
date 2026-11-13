@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "ae_sdk.hpp"
 #include "librenoise/librenoise.hpp"
 
@@ -66,7 +67,7 @@ PF_Err handle_about(PF_InData* in_data, PF_OutData* out_data) {
     (void)in_data;
     if (out_data) {
         std::strncpy(out_data->return_msg,
-            "LibreNoise Video Denoiser v0.2.0\n"
+            "LibreNoise Video Denoiser v0.2.1\n"
             "Open-source production-grade temporal & spatial video denoiser.\n"
             "Accelerated via CUDA sm_86 & AVX2.",
             sizeof(out_data->return_msg) - 1);
@@ -77,7 +78,7 @@ PF_Err handle_about(PF_InData* in_data, PF_OutData* out_data) {
 PF_Err handle_global_setup(PF_InData* in_data, PF_OutData* out_data) {
     (void)in_data;
     if (out_data) {
-        out_data->my_version = 0x00020000; // 0.2.0
+        out_data->my_version = 0x00020001; // 0.2.1
         out_data->out_flags = PF_OutFlag_PIX_INDEPENDENT |
                               PF_OutFlag_DEEP_COLOR_AWARE |
                               PF_OutFlag_CUSTOM_UI;

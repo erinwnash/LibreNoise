@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // LibreNoise v0.2 processing pipeline, written once and instantiated for the CPU and CUDA back ends.
 //
 // Stages for one output frame:

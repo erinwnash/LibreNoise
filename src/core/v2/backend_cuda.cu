@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // CUDA back end for the v0.2 pipeline. Same templated pipeline as the CPU path (pipeline_impl.inl).
 #include "librenoise/v2/pipeline.hpp"
 #include "pipeline_impl.inl"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Used when the CUDA toolkit is not available at build time.
 #include "librenoise/v2/pipeline.hpp"
 

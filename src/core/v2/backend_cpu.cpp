@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // CPU (OpenMP) back end for the v0.2 pipeline.
 #include "librenoise/v2/pipeline.hpp"
 #include "pipeline_impl.inl"

@@ -35,7 +35,7 @@ Targets:
 LibreNoise is an original, clean-room implementation developed exclusively from peer-reviewed scientific literature (*Maggioni et al., IEEE TIP 2012*; *Abdelhamed et al., CVPR 2018*). 
 
 - **Two-Party Clean-Room Defense**: Implementers code strictly from formal specifications in `docs/specs/` and **never view or execute non-commercial code (such as TAU's MATLAB/Python code)**.
-- **Licensing**: Licensed under the **GNU General Public License v3.0 (GPLv3)**.
+- **Licensing**: Licensed under the **Apache License 2.0** from v0.2.1 on (v0.1.0 and v0.2.0 were released under GPLv3 and remain available under it).
 - **Host Integration**: In accordance with VFX industry standards, the OpenFX bundle is loaded dynamically at runtime via the OpenFX C API.
 
 See [`PROVENANCE.md`](PROVENANCE.md) for detailed citations, origin tracking, and developer certification protocols.
@@ -96,6 +96,10 @@ GPU of compute capability 8.6 or newer; macOS has no CUDA.
 
 - [v0.2 design and test results](docs/V0_2_DESIGN.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+## License
+
+Apache License 2.0 (see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE)); third-party components are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Versions 0.1.0 and 0.2.0 were released under GPLv3 and remain available under it.
 
 ## Support
 

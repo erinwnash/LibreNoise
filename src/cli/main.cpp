@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // LibreNoise v0.2 command-line renderer.
 //
 //   librenoise_cli --in E:/media/source/clip1.%04d.exr --out E:/out/clip1.%04d.exr --frames 1029 1031
